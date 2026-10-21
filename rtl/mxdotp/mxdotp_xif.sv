@@ -57,8 +57,8 @@
 //   exclusively through the FUSED slot.
 //
 //   The mailbox carrying MXDOTP's raw p1/p2 to MXFINAL is a MAILBOX_DEPTH=4
-//   FIFO (see that section below for the depth's derivation and its own
-//   correctness argument), not a single entry - it had to stop being
+//   FIFO (see that section below: the depth bounds how many MXDOTP may run
+//   ahead of their MXFINALs before the host deadlocks), not a single entry - it had to stop being
 //   single-entry the moment MXDOTP gained more than one outstanding
 //   instruction, since a second MXDOTP's result could otherwise arrive
 //   before MXFINAL had consumed the first.
@@ -538,22 +538,35 @@ module mxdotp_xif
     // hand-off at all (see mxdotp_fused_engine.sv's own internal front-end/
     // back-end register instead).
     //
-    // MAILBOX_DEPTH=4 sizing: this is a throughput knob, not a correctness
-    // one - mailbox_push only fires when !mailbox_full (see below), and the
-    // DOTP engine's own result_ready_i is tied to that same !mailbox_full,
-    // so a full mailbox stalls the DOTP engine's own pipeline rather than
-    // overflowing or overwriting an unconsumed entry, for ANY depth >= 1.
-    // The theoretical worst case is higher than 4: MXDOTP's engine is a
-    // 5-stage pipeline (mxdotp_dotp_engine.sv) that could have up to 5
-    // results completed back-to-back before MXFINAL has consumed any of
-    // them, plus MX_DOTP_PENDING_DEPTH=2 more instructions that could then
-    // enter that pipeline right behind them - so up to ~7 unconsumed
-    // results are possible in a pathological burst with no interleaved
-    // MXFINAL at all. 4 was picked as a plausible middle ground rather than
-    // derived from that bound; since correctness doesn't depend on the
-    // exact number, this is a candidate for future tuning (e.g. counting
-    // mailbox-full stall cycles in a real DOTP-heavy workload) rather than
-    // something that needs resolving now.
+    // MAILBOX_DEPTH=4 sizing - this IS a correctness bound, not only a
+    // throughput knob. (The earlier version of this comment said correctness
+    // held for any depth >= 1; that is wrong on an in-order host.)
+    //
+    // Usage rule (CV32E40X host): at most MAILBOX_DEPTH (4) MXDOTP may be
+    // outstanding ahead of the first of their MXFINALs. A (MAILBOX_DEPTH+1)th
+    // - the 5th - is safe only if the instruction directly after it is an
+    // MXFINAL. Anything more (e.g. 6 consecutive MXDOTP) deadlocks.
+    //
+    // Why: an MXDOTP result retires into the mailbox and over the XIF result
+    // channel on the same edge (dotp_result_fire, below), so the MXDOTP sits
+    // in the core's WB stage until the mailbox has space - CV32E40X holds an
+    // offloaded instruction in WB until its result arrives. Entries are freed
+    // only when an MXFINAL starts, which needs its commit, and CV32E40X only
+    // commits the offloaded instruction in EX. With the MXDOTP stuck in WB,
+    // the one instruction that can still commit is the one directly behind
+    // it: if that is an MXFINAL it pops an entry and the MXDOTP retires; if
+    // not, nothing can free space. Every entry already in the mailbox belongs
+    // to an older MXDOTP whose MXFINAL is younger than the stalled one (an
+    // older MXFINAL would already have retired, so started, so popped).
+    // Pair-interleaved code (MXDOTP, MXFINAL, MXDOTP, ...) never has more
+    // than one entry in the mailbox.
+    //
+    // Raising MAILBOX_DEPTH raises the bound one for one. Returning the
+    // MXDOTP's XIF result early (at commit, CV-X-IF-legal) would raise it
+    // further - the engine pipeline and dotp_pending_q would absorb the
+    // overflow - but not remove it: past that, issue_ready for a later MXDOTP
+    // would wait on an MXFINAL that is younger still. Analysis 21 Oct 2026;
+    // the 5-consecutive case is exercised by make stream (S6).
     //--------------------------------------------------------------------------
 
     
@@ -574,7 +587,19 @@ module mxdotp_xif
                                              // creating this as an implicit 1-bit net, truncating
                                              // dotp_engine's real X_ID_WIDTH-bit result_id_o down
                                              // to its LSB before it ever reached result_if.result.id
-    wire mailbox_push = dotp_result_valid && !mailbox_full;
+    // A DOTP result retires in ONE step: into the mailbox AND over the XIF
+    // result channel, on the same edge. Both conditions are required:
+    //   !mailbox_full          - somewhere to put p1/p2;
+    //   dotp_result_ready_xif  - the DOTP slot is at the order-queue head and
+    //                            the core accepts the result this cycle.
+    // Previously the engine retired on !mailbox_full alone, so a DOTP result
+    // that completed while an OLDER slot (e.g. the previous pair's FINAL) held
+    // the head went into the mailbox and its XIF result was never sent - the
+    // core then waited for it in WB forever (back-to-back pairs hung; found by
+    // the make-stream measurement, 21 Oct 2026). The engine's global stall
+    // holds result_valid until this fires.
+    wire dotp_result_fire = dotp_result_valid && !mailbox_full && dotp_result_ready_xif;
+    wire mailbox_push = dotp_result_fire;
     wire mailbox_pop = final_engine_start;
     
     always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -608,7 +633,7 @@ module mxdotp_xif
         .start_i (dotp_engine_start),
         .ready_o (dotp_engine_ready),
         .result_valid_o (dotp_result_valid),
-        .result_ready_i (!mailbox_full),
+        .result_ready_i (!mailbox_full && dotp_result_ready_xif),
         .id_i (dotp_pending_q[dotp_pending_head_ptr].id),
         .result_id_o (dotp_result_id),
         .rs1_i (dotp_pending_q[dotp_pending_head_ptr].rs1),
@@ -945,7 +970,11 @@ module mxdotp_xif
         if (!order_empty) begin
             unique case (order_head_tag)
                 MX_SLOT_DOTP: begin
-                    if (dotp_result_valid) begin
+                    // Gated by !mailbox_full so the XIF handshake can only
+                    // complete on the same edge as the mailbox push (see
+                    // dotp_result_fire). Never retracted once raised: only a
+                    // DOTP push can fill the mailbox, and that is this result.
+                    if (dotp_result_valid && !mailbox_full) begin
                         result_if.result_valid = 1'b1;
                         result_if.result.id    = dotp_result_id;
                         result_if.result.rd    = 5'd0;

@@ -362,6 +362,36 @@ $(foreach t,$(UNIT_TESTS),$(eval $(call UNIT_TEST_template,$(t))))
 units: $(UNIT_TESTS)
 
 #==============================================================================
+# Directed stream measurement (make stream)
+#------------------------------------------------------------------------------
+# Same system testbench, built with MX_STREAM_TEST: instr_rom.sv swaps in the
+# back-to-back stream program and tb_mxdotp_core.sv runs a fixed window instead
+# of the Tests 1-5 scoreboard. A measurement run, not a regression - the output
+# is the [XIFMON] log. Own build dir, so it never disturbs `make full`'s build;
+# it is run from that dir, so its VCD lands there too, not in tb/.
+#==============================================================================
+
+STREAM_BUILD_DIR := $(BUILD_ROOT)/stream
+STREAM_EXECUTABLE := $(STREAM_BUILD_DIR)/V$(TOP_MODULE)
+STREAM_VERILATOR_FLAGS := $(subst --Mdir $(BUILD_DIR),--Mdir $(STREAM_BUILD_DIR),$(VERILATOR_FLAGS)) -DMX_STREAM_TEST
+
+.PHONY: stream
+stream: $(STREAM_EXECUTABLE)
+	@echo
+	@echo "==============================="
+	@echo "Running stream measurement..."
+	@echo "==============================="
+	cd $(STREAM_BUILD_DIR) && ./V$(TOP_MODULE)
+
+$(STREAM_EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
+	@mkdir -p $(STREAM_BUILD_DIR)
+	$(VERILATOR) $(STREAM_VERILATOR_FLAGS) \
+		-f $(VERILATOR_FLIST) \
+		$(MXDOTP_SRCS) \
+		$(TB_SRCS) \
+		$(CXX_FILES)
+
+#==============================================================================
 # Utilities
 #==============================================================================
 

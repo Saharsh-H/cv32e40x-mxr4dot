@@ -27,7 +27,8 @@
 // them, so that by the time Q is issued, P is still mid-flight through the
 // engine's own pipeline - and likewise for R.
 //
-// Five tests run in sequence:
+// Six tests run in sequence (Test 5 and Test 6 are described next to their
+// register assignments further down):
 //
 //   1) MXFUSED x3, back-to-back, MX_FMT_MXFP4 (plain, no residue):
 //        P: A = B = {1.0 x16}, scales = 1.0/1.0, old_acc = 0.0
@@ -78,10 +79,14 @@ module instr_rom
     import tb_pkg::*;
     import mxdotp_pkg::*;
 #(
-  parameter int unsigned NUM_WORDS = 128 // power of 2 - instr_rdata_o's address decode
+`ifdef MX_STREAM_TEST
+  parameter int unsigned NUM_WORDS = 256 // stream program (make stream) is ~210 words
+`else
+  parameter int unsigned NUM_WORDS = 256 // power of 2 - instr_rdata_o's address decode
                                           // (addr_q[$clog2(NUM_WORDS)+1:2]) assumes that;
                                           // a non-power-of-2 NUM_WORDS would let that index
                                           // run past rom[]'s actual bound
+`endif
 )
 (
   input  logic        clk_i,
@@ -446,10 +451,140 @@ module instr_rom
     REG_T5_RFINAL_RESULT, REG_T5_SCALES, REG_T5_OLD_ACC, 5'd0 /*rs3 unused*/
   );
 
+  //----------------------------------------------------------------------------
+  // Test 6: back-to-back MXDOTP/MXFINAL pairs (DOTP, FINAL, DOTP, FINAL, ...).
+  //
+  // Tests 2 and 5 only ever run ONE residue pair at a time, so the DOTP result
+  // always reaches the XIF while the DOTP slot is already at the order-queue
+  // head. Back-to-back pairs break that: the 2nd DOTP's result can leave the
+  // DOTP engine while the 1st FINAL still holds the head. This test checks
+  // that every pair still completes, in program order, with the right value.
+  // (Found 21 Oct 2026 by the make-stream measurement: at that point the 2nd
+  // DOTP's XIF result was lost and the core hung waiting for it in WB.)
+  //
+  // Operands REUSE Test 5's registers unchanged (x13-x18 A2/B2/AR2, x29
+  // scales, x30 old_acc = 4.0) and the identical instruction words, so every
+  // FINAL must produce MXFP4_RESIDUAL2_EXPECTED (84.0, golden-derived - see
+  // Test 5). Checked on the RESULT channel by tb_mxdotp_core.sv's Test 6
+  // monitor (DOTP: we=0; FINAL: we=1, rd=x21, data=84.0), not by WB latches.
+  //----------------------------------------------------------------------------
+  localparam int unsigned T6_NUM_PAIRS = 3;
+
   localparam logic [31:0] INSTR_JAL_SELF = encode_j(OPCODE_JAL, 5'd0, 21'd0); // infinite self-loop
   localparam logic [31:0] INSTR_NOP      = encode_i(OPCODE_OPIMM, 3'b000, 5'd0, 5'd0, 12'd0);
 
   logic [31:0] rom [0:NUM_WORDS-1];
+
+`ifdef MX_STREAM_TEST
+  //----------------------------------------------------------------------------
+  // Directed stream program (make stream only - MX_STREAM_TEST). Measures the
+  // sustained rate of back-to-back MX instructions; it replaces Tests 1-5, so
+  // the scoreboard is not used in this build (see tb_mxdotp_core.sv) and the
+  // output is the [XIFMON] log.
+  //
+  // Streams, in program order (S5 runs before S4), each followed by
+  // STREAM_GAP NOPs:
+  //   S1  16 x mxfused MXFP4         rs1=x2  rs2=x4  rs3=x6   rd = x20..x27 rotating
+  //   S2  16 x mxfused MXFP8 E4M3    rs1=x8  rs2=x8  rs3=x10  rd = x20..x27 rotating
+  //   S3  16 x mxfused M2XFP4        rs1=x12 rs2=x4  rs3=x14  rd = x20..x27 rotating
+  //   S5  16 x mxfused MXFP4 chained: rd=x28 is the next instruction's
+  //       accumulator (rs3 = {x29 scales, x28 acc})
+  //   S4  16 x (mxresdot rs1=x2 rs2=x4 rs3=x16, rd=x0;
+  //             mxfinal  rs1=x18 rs2=x19,        rd = x20..x27 rotating)
+  //       (Before the 21 Oct mxdotp_xif.sv fix this stream hung at its second
+  //       pair, which is why it runs after S5.)
+  //   S6  mailbox-depth boundary: 5 x mxresdot back to back, then 5 x mxfinal
+  //       (same operands as S4). The 5th mxresdot finds the mailbox full and
+  //       can only retire because the next instruction is an mxfinal - see the
+  //       MAILBOX_DEPTH usage rule in mxdotp_xif.sv. 6 would deadlock.
+  // Register audit: sources are x2-x19 and x28/x29, loaded once up front;
+  // x20-x27 are written and never read, so S1-S4 have no data dependencies
+  // between instructions. Only S5 is dependent, on purpose.
+  //
+  // Expected results (golden models, bit-level model == exact reference):
+  //   S1 0x41800000 (16.0)   S2 0x41000000 (8.0)   S3 0x41EF0000 (29.875)
+  //   S4 and S6 mxfinal 0x41C00000 (24.0, mxresdot p1=64 p2=32)
+  //   S5 16.0, 32.0, ..., 256.0 (step k: 16*k)
+  //----------------------------------------------------------------------------
+  localparam int unsigned STREAM_LEN = 16;
+  localparam int unsigned STREAM_GAP = 12;
+  localparam int unsigned STREAM_S6_DEPTH = 5;  // MAILBOX_DEPTH + 1
+  localparam int unsigned STREAM_NUM_LOADS = 20;
+
+  localparam logic [4:0]  STREAM_LOAD_REG [0:STREAM_NUM_LOADS-1] = '{
+    5'd2,  5'd3,  5'd4,  5'd5,  5'd6,  5'd7,  5'd8,  5'd9,  5'd10, 5'd11,
+    5'd12, 5'd13, 5'd14, 5'd15, 5'd16, 5'd17, 5'd18, 5'd19, 5'd28, 5'd29
+  };
+  localparam logic [31:0] STREAM_LOAD_VAL [0:STREAM_NUM_LOADS-1] = '{
+    32'h2222_2222, 32'h2222_2222,   // x2/x3   MXFP4 A  = 16x 1.0
+    32'h2222_2222, 32'h2222_2222,   // x4/x5   MXFP4 B  = 16x 1.0
+    32'h0000_0000, 32'h0000_7F7F,   // x6/x7   rs3: acc 0.0 / {b=127,a=127}
+    32'h3838_3838, 32'h3838_3838,   // x8/x9   E4M3 A=B = 8x 1.0
+    32'h0000_0000, 32'h0000_7F7F,   // x10/x11 rs3: acc 0.0 / scales, bit48=0 (E4M3)
+    32'h2222_2722, 32'h2222_2222,   // x12/x13 M2XFP4 A (Test 4's U activations)
+    32'h0000_0000, 32'h013E_7F7F,   // x14/x15 rs3: acc 0.0 / sg_em={2,1} elem_em={3,3} scales
+    32'h1111_1111, 32'h1111_1111,   // x16/x17 residue AR = 16x 0.5
+    32'h7F7F_7F00,                  // x18     mxfinal scales {a,ar,b,rsvd} = 127/127/127
+    32'h0000_0000,                  // x19     mxfinal old acc 0.0
+    32'h0000_0000, 32'h0000_7F7F    // x28/x29 chain rs3: acc 0.0 / scales
+  };
+
+  task automatic stream_program();
+    int unsigned p;
+    logic [31:0] lui_w, addi_w;
+    p = 0;
+    for (int unsigned k = 0; k < STREAM_NUM_LOADS; k++) begin
+      encode_li32(STREAM_LOAD_REG[k], STREAM_LOAD_VAL[k], lui_w, addi_w);
+      rom[p] = lui_w;  p = p + 1;
+      rom[p] = addi_w; p = p + 1;
+    end
+    p = p + STREAM_GAP;  // rom[] is pre-filled with NOPs
+    // S1: MXFP4
+    for (int unsigned k = 0; k < STREAM_LEN; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4, 5'(20 + k % 8), 5'd2, 5'd4, 5'd6);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    // S2: MXFP8 E4M3
+    for (int unsigned k = 0; k < STREAM_LEN; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP8, 5'(20 + k % 8), 5'd8, 5'd8, 5'd10);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    // S3: M2XFP4
+    for (int unsigned k = 0; k < STREAM_LEN; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_M2XFP4, 5'(20 + k % 8), 5'd12, 5'd4, 5'd14);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    // S5: MXFP4 accumulator chain (rd = next rs3 low word)
+    for (int unsigned k = 0; k < STREAM_LEN; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4, 5'd28, 5'd2, 5'd4, 5'd28);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    // S4: mxresdot / mxfinal pairs
+    for (int unsigned k = 0; k < STREAM_LEN; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_DOTP,  MX_FMT_MXFP4_RESIDUAL, 5'd0, 5'd2, 5'd4, 5'd16);
+      p = p + 1;
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FINAL, MX_FMT_MXFP4_RESIDUAL, 5'(20 + k % 8), 5'd18, 5'd19, 5'd0);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    // S6: 5 x mxresdot, then 5 x mxfinal (mailbox-depth boundary)
+    for (int unsigned k = 0; k < STREAM_S6_DEPTH; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_DOTP,  MX_FMT_MXFP4_RESIDUAL, 5'd0, 5'd2, 5'd4, 5'd16);
+      p = p + 1;
+    end
+    for (int unsigned k = 0; k < STREAM_S6_DEPTH; k++) begin
+      rom[p] = encode_r4(MX_OPCODE, MX_FUNCT3_FINAL, MX_FMT_MXFP4_RESIDUAL, 5'(20 + k % 8), 5'd18, 5'd19, 5'd0);
+      p = p + 1;
+    end
+    p = p + STREAM_GAP;
+    rom[p] = INSTR_JAL_SELF;
+    assert (p < NUM_WORDS) else $fatal(1, "stream program overflows rom[] (%0d words)", p + 1);
+  endtask
+`endif
 
   initial begin
     int i;
@@ -551,6 +686,9 @@ module instr_rom
     encode_li32(REG_T5_SCALES,  T5_RSCALES_VAL, lui_t5sc,  addi_t5sc);
     encode_li32(REG_T5_OLD_ACC, T5_OLD_ACC_VAL, lui_t5acc, addi_t5acc);
 
+`ifdef MX_STREAM_TEST
+    stream_program();
+`else
     // --- Test 1: MXFUSED x3 back-to-back (P, Q, R) ---
     // ALL operands for P, Q, and R are loaded FIRST, before any of the three
     // FUSED instructions issue - this is deliberate: once P/Q/R start
@@ -679,10 +817,19 @@ module instr_rom
     rom[121] = INSTR_MXFUSED_T5;    // unrelated MXFP4 (rd=x9) -> must not disturb mailbox
     rom[122] = INSTR_MXFINAL_RES2;  // res2 FINAL (rd=x21) -> drains mailbox
 
-    rom[123] = INSTR_JAL_SELF;
+    // --- Test 6: back-to-back MXDOTP/MXFINAL pairs, nothing in between ---
+    rom[123] = INSTR_MXDOTP_RES2;   // pair 1
+    rom[124] = INSTR_MXFINAL_RES2;
+    rom[125] = INSTR_MXDOTP_RES2;   // pair 2 - its DOTP result can complete while pair 1's FINAL holds the head
+    rom[126] = INSTR_MXFINAL_RES2;
+    rom[127] = INSTR_MXDOTP_RES2;   // pair 3
+    rom[128] = INSTR_MXFINAL_RES2;
+
+    rom[129] = INSTR_JAL_SELF;
 
     // Add further instructions here, e.g.:
-    //   rom[124] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+    //   rom[130] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+`endif
   end
 
   //----------------------------------------------------------------------------

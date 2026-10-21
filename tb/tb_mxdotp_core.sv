@@ -422,6 +422,7 @@ module tb_mxdotp_core;
     SB_WAIT_M2W_WB,
     SB_WAIT_T5_FUSED_WB,
     SB_WAIT_T5_RFINAL_WB,
+    SB_WAIT_T6_PAIRS,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
@@ -937,8 +938,48 @@ module tb_mxdotp_core;
         T5ORD_DOTP:  if (!xif_result_we)                                       t5_ord_q <= T5ORD_FUSED; else t5_ord_bad <= 1'b1;
         T5ORD_FUSED: if (xif_result_we && (xif_result_rd == exp_t5_fused_rd))  t5_ord_q <= T5ORD_FINAL; else t5_ord_bad <= 1'b1;
         T5ORD_FINAL: if (xif_result_we && (xif_result_rd == exp_t5_rfinal_rd)) t5_ord_q <= T5ORD_DONE;  else t5_ord_bad <= 1'b1;
-        default: t5_ord_bad <= 1'b1;  // a 4th result in Test 5's window - unexpected
+        // Test 5's window closes once its FINAL has retired: every later
+        // result belongs to Test 6 and is checked by the Test 6 monitor below
+        // (which keeps the "no unexpected extra result" check at the end).
+        T5ORD_DONE: ;
+        default: t5_ord_bad <= 1'b1;
       endcase
+    end
+  end
+
+  //----------------------------------------------------------------------------
+  // Test 6 monitor - back-to-back MXDOTP/MXFINAL pairs, on the RESULT channel.
+  // Starts where Test 5's window ends (t5_ord_q == T5ORD_DONE, registered, so
+  // Test 5's own FINAL result is never counted here). Expected sequence, in
+  // program order: DOTP (we=0), FINAL (we=1, rd=x21, data=84.0), repeated
+  // T6_NUM_PAIRS times. Anything else - wrong kind, wrong rd/data, or a result
+  // beyond the last pair - sets t6_bad. If a DOTP result is lost (the hang this
+  // test was written for), t6_count_q stops short and the scoreboard times out
+  // in SB_WAIT_T6_PAIRS.
+  //----------------------------------------------------------------------------
+  wire [7:0]  t6_num_results     = 8'(2 * u_instr_rom.T6_NUM_PAIRS);
+  wire [4:0]  exp_t6_final_rd    = u_instr_rom.REG_T5_RFINAL_RESULT;      // x21
+  wire [31:0] exp_t6_final_data  = u_instr_rom.MXFP4_RESIDUAL2_EXPECTED;  // 84.0
+
+  logic [7:0] t6_count_q;
+  logic       t6_bad;
+
+  wire t6_res_hit = (t5_ord_q == T5ORD_DONE) && xif_result_valid && xif_result_ready;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      t6_count_q <= '0;
+      t6_bad     <= 1'b0;
+    end else if (t6_res_hit) begin
+      if (t6_count_q >= t6_num_results)
+        t6_bad <= 1'b1;                                     // result after the last pair
+      else if (!t6_count_q[0]) begin
+        if (xif_result_we) t6_bad <= 1'b1;                  // expected a DOTP (no writeback)
+      end else begin
+        if (!(xif_result_we && (xif_result_rd == exp_t6_final_rd) && (xif_result_data == exp_t6_final_data)))
+          t6_bad <= 1'b1;                                   // expected FINAL x21 <= 84.0
+      end
+      t6_count_q <= t6_count_q + 8'd1;
     end
   end
 
@@ -1502,12 +1543,27 @@ module tb_mxdotp_core;
               $display("[%0t] T5 MXFINAL(res2) WB ok: x%0d <= 0x%0h (mailbox survived interleaved MXFUSED)", $time, exp_t5_rfinal_rd, wb_data13_q);
               $display("[%0t] T5 ORDER ok: MXDOTP(no-wb) -> MXFUSED(x%0d) -> MXFINAL(x%0d) retired in program order",
                         $time, exp_t5_fused_rd, exp_t5_rfinal_rd);
-              $display("=====================================================");
-              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap -> M2XFP4+3-engine overlap -> MXDOTP/MXFINAL mailbox robustness all traversed");
-              $display("=====================================================");
-              pass_count++;
-              sb_state <= SB_DONE;
+              sb_state <= SB_WAIT_T6_PAIRS;
             end
+          end
+        end
+
+        //----------------------------------------------------------------
+        // Test 6: back-to-back MXDOTP/MXFINAL pairs. Waits for the Test 6
+        // monitor to see all 2*T6_NUM_PAIRS results; see that monitor and
+        // instr_rom.sv's Test 6 header.
+        //----------------------------------------------------------------
+        SB_WAIT_T6_PAIRS: begin
+          if (t6_bad) begin
+            sb_fail("Test 6 back-to-back MXDOTP/MXFINAL pairs: wrong result sequence (expected DOTP we=0, then FINAL x21 <= 84.0, per pair, in program order, and nothing after the last pair)");
+          end else if (t6_count_q == t6_num_results) begin
+            $display("[%0t] T6 PAIRS ok: %0d back-to-back MXDOTP/MXFINAL pairs retired in program order, every MXFINAL x%0d <= 0x%0h",
+                      $time, t6_num_results / 2, exp_t6_final_rd, exp_t6_final_data);
+            $display("=====================================================");
+            $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap -> M2XFP4+3-engine overlap -> MXDOTP/MXFINAL mailbox robustness -> back-to-back MXDOTP/MXFINAL pairs all traversed");
+            $display("=====================================================");
+            pass_count++;
+            sb_state <= SB_DONE;
           end
         end
 
@@ -1523,8 +1579,22 @@ module tb_mxdotp_core;
 
   //----------------------------------------------------------------------------
   // Watchdog: bounds simulation time and reports final PASS/FAIL
+  //
+  // In the stream-measurement build (make stream, MX_STREAM_TEST) instr_rom.sv
+  // holds the directed stream program instead of Tests 1-5, so the scoreboard
+  // never leaves its first state and is not consulted: the run stops after a
+  // fixed window and the [XIFMON] log is the output.
   //----------------------------------------------------------------------------
 
+`ifdef MX_STREAM_TEST
+  localparam int unsigned STREAM_RUN_CYCLES = 1500;
+
+  initial begin
+    repeat (STREAM_RUN_CYCLES) @(posedge clk_i);
+    $display("STREAM RUN COMPLETE after %0d cycles (scoreboard not used in this build)", STREAM_RUN_CYCLES);
+    $finish;
+  end
+`else
   initial begin
     repeat (TIMEOUT_CYCLES) @(posedge clk_i);
     if (sb_state != SB_DONE) begin
@@ -1546,16 +1616,79 @@ module tb_mxdotp_core;
     else
       $finish;
   end
+`endif
+
+  //----------------------------------------------------------------------------
+  // Passive XIF monitor - measurement only, drives nothing.
+  //
+  // Prints one "[XIFMON]" line per issue / commit / result handshake, sampled
+  // on the same rising edge (pre-edge values) the scoreboard's capture latches
+  // above use. Timing is a cycle count, not $time: mon_cycle_q reads 0 on the
+  // first rising edge after rst_ni is released and +1 on every edge after.
+  // It only reads the xif_* taps above; no scoreboard state or check uses it.
+  //----------------------------------------------------------------------------
+
+  longint unsigned mon_cycle_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) mon_cycle_q <= '0;
+    else         mon_cycle_q <= mon_cycle_q + 1;
+  end
+
+  // Mnemonic from funct3/funct2 (encodings: mxdotp_pkg.sv). For MXFP8 under
+  // mxfused, rs3[48] picks E4M3 (0) / E5M2 (1).
+  function automatic string mon_instr_name(input logic [31:0] instr, input logic fp8_e5m2);
+    if (instr[6:0] != mxdotp_pkg::MX_OPCODE) return "non-MX";
+    case (instr[14:12])
+      mxdotp_pkg::MX_FUNCT3_FUSED:
+        case (instr[26:25])
+          mxdotp_pkg::MX_FMT_MXFP4:  return "mxfused.mxfp4";
+          mxdotp_pkg::MX_FMT_M2XFP4: return "mxfused.m2xfp4";
+          mxdotp_pkg::MX_FMT_MXFP8:  return fp8_e5m2 ? "mxfused.mxfp8.e5m2" : "mxfused.mxfp8.e4m3";
+          default:                   return "mxfused.fmt01";
+        endcase
+      mxdotp_pkg::MX_FUNCT3_DOTP:          return "mxresdot";
+      mxdotp_pkg::MX_FUNCT3_FINAL:         return "mxfinal";
+      mxdotp_pkg::MX_FUNCT3_DUALREAD_TEST: return "mxdualread_test";
+      default:                             return "mx.unknown";
+    endcase
+  endfunction
+
+  always @(posedge clk_i) begin
+    if (rst_ni) begin
+      // Only an accepted handshake is an issue. A rejected one (the core then
+      // treats the instruction as illegal) is printed under its own label so
+      // it is never counted as an ISSUE.
+      if (xif_issue_valid && xif_issue_ready && xif_issue_accept)
+        $display("[XIFMON] cyc=%0d ISSUE  id=%0d %s f3=%03b f2=%02b rd=x%0d",
+                 mon_cycle_q, xif_issue_id, mon_instr_name(xif_issue_instr, xif_issue_rs2_wide[48]),
+                 xif_issue_instr[14:12], xif_issue_instr[26:25], xif_issue_instr[11:7]);
+      else if (xif_issue_valid && xif_issue_ready)
+        $display("[XIFMON] cyc=%0d REJECTED-ISSUE id=%0d instr=0x%08h",
+                 mon_cycle_q, xif_issue_id, xif_issue_instr);
+      if (xif_commit_valid)
+        $display("[XIFMON] cyc=%0d COMMIT id=%0d kill=%0b", mon_cycle_q, xif_commit_id, xif_commit_kill);
+      if (xif_result_valid && xif_result_ready)
+        $display("[XIFMON] cyc=%0d RESULT id=%0d rd=x%0d we=%0b data=0x%08h",
+                 mon_cycle_q, xif_result_id, xif_result_rd, xif_result_we, xif_result_data);
+    end
+  end
 
   //----------------------------------------------------------------------------
   // Waveform dump (VCD - portable across simulators; use a simulator-native
   // wave config for the grouped Issue/Commit/Result/FSM/WB view during
   // interactive runs)
+  //
+  // Under Verilator, verilator_tb.cpp already writes tb_mxdotp_core.vcd through
+  // VerilatedVcdC. Opening the same file here as well gave two writers and an
+  // interleaved, unreadable trace, so this block is for other simulators only.
   //----------------------------------------------------------------------------
 
+`ifndef VERILATOR
   initial begin
     $dumpfile("tb_mxdotp_core.vcd");
     $dumpvars(0, tb_mxdotp_core);
   end
+`endif
 
 endmodule

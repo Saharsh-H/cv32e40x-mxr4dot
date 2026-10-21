@@ -57,6 +57,8 @@ module tb_mxdotp_core;
   logic clk_i;
   logic rst_ni;
 
+  longint unsigned mon_cycle_q;  // cycle counter of the [XIFMON] monitor (see there)
+
   initial clk_i = 1'b0;
   always #(CLK_PERIOD/2) clk_i = ~clk_i;
 
@@ -158,6 +160,54 @@ module tb_mxdotp_core;
 
   assign fencei_flush_ack = fencei_flush_req; // auto-ack, not exercised by this program
 
+`ifdef MX_PROGRAM_IMAGE
+  //----------------------------------------------------------------------------
+  // Program-image build (make loop): one RAM serves both ports, loaded from
+  // +image=<file>; see mem_model.sv. instr_rom stays instantiated but idle,
+  // only because the Tests 1-6 scoreboard below reads its constants
+  // hierarchically (u_instr_rom.*) and must still elaborate. The scoreboard
+  // itself is not used in this build (see sb_fail and the watchdog).
+  //----------------------------------------------------------------------------
+  logic        img_exit_valid;
+  logic [31:0] img_exit_code;
+  logic        unused_rom_gnt, unused_rom_rvalid, unused_rom_err;
+  logic [31:0] unused_rom_rdata;
+
+  instr_rom u_instr_rom (
+    .clk_i          ( clk_i             ),
+    .rst_ni         ( rst_ni            ),
+    .instr_req_i    ( 1'b0              ),
+    .instr_gnt_o    ( unused_rom_gnt    ),
+    .instr_rvalid_o ( unused_rom_rvalid ),
+    .instr_addr_i   ( 32'h0             ),
+    .instr_rdata_o  ( unused_rom_rdata  ),
+    .instr_err_o    ( unused_rom_err    )
+  );
+
+  mem_model u_mem (
+    .clk_i          ( clk_i          ),
+    .rst_ni         ( rst_ni         ),
+    .cycle_i        ( mon_cycle_q    ),
+    .instr_req_i    ( instr_req      ),
+    .instr_gnt_o    ( instr_gnt      ),
+    .instr_rvalid_o ( instr_rvalid   ),
+    .instr_addr_i   ( instr_addr     ),
+    .instr_rdata_o  ( instr_rdata    ),
+    .instr_err_o    ( instr_err      ),
+    .data_req_i     ( data_req       ),
+    .data_gnt_o     ( data_gnt       ),
+    .data_rvalid_o  ( data_rvalid    ),
+    .data_we_i      ( data_we        ),
+    .data_be_i      ( data_be        ),
+    .data_addr_i    ( data_addr      ),
+    .data_wdata_i   ( data_wdata     ),
+    .data_rdata_o   ( data_rdata     ),
+    .data_err_o     ( data_err       ),
+    .data_exokay_o  ( data_exokay    ),
+    .exit_valid_o   ( img_exit_valid ),
+    .exit_code_o    ( img_exit_code  )
+  );
+`else
   instr_rom u_instr_rom (
     .clk_i          ( clk_i        ),
     .rst_ni         ( rst_ni       ),
@@ -183,6 +233,7 @@ module tb_mxdotp_core;
     .data_err_o    ( data_err    ),
     .data_exokay_o ( data_exokay )
   );
+`endif
 
   mxdotp_core_top dut (
     .clk_i                 ( clk_i               ),
@@ -984,6 +1035,12 @@ module tb_mxdotp_core;
   end
 
   task automatic sb_fail(string msg);
+`ifdef MX_PROGRAM_IMAGE
+    // Program-image build: the Tests 1-6 scoreboard has no program to check
+    // (a compiled program could even reuse one of their instruction words),
+    // so its verdicts are ignored here; pass/fail is the program's EXIT code.
+    return;
+`endif
     $display("[%0t] FAIL: %s", $time, msg);
     fail_count++;
     sb_fail_this_cycle = 1'b1;
@@ -1586,7 +1643,41 @@ module tb_mxdotp_core;
   // fixed window and the [XIFMON] log is the output.
   //----------------------------------------------------------------------------
 
-`ifdef MX_STREAM_TEST
+`ifdef MX_PROGRAM_IMAGE
+  // Pipeline taps for waveform inspection (program-image build only): the PC
+  // and valid bit of the instruction held in each stage register, as named
+  // signals in the VCD (the pipe structs are traced as flat vectors).
+  wire [31:0] dbg_pc_if = dut.core_i.pc_if;
+  wire [31:0] dbg_pc_id = dut.core_i.if_id_pipe.pc;
+  wire        dbg_v_id  = dut.core_i.if_id_pipe.instr_valid;
+  wire [31:0] dbg_pc_ex = dut.core_i.id_ex_pipe.pc;
+  wire        dbg_v_ex  = dut.core_i.id_ex_pipe.instr_valid;
+  wire [31:0] dbg_pc_wb = dut.core_i.ex_wb_pipe.pc;
+  wire        dbg_v_wb  = dut.core_i.ex_wb_pipe.instr_valid;
+
+  // Program-image build (make loop): the program ends itself by writing its
+  // exit code to mem_model's EXIT register (0 = pass). +max_cycles=<n> bounds
+  // the run (default 2,000,000); reaching it is a failure. +stop_at=<cycle>
+  // ends the run cleanly at that cycle instead (for a short traced window).
+  initial begin
+    longint unsigned max_cycles, stop_at;
+    if (!$value$plusargs("max_cycles=%d", max_cycles)) max_cycles = 2_000_000;
+    if ($value$plusargs("stop_at=%d", stop_at)) begin
+      while (!img_exit_valid && (mon_cycle_q < stop_at)) @(posedge clk_i);
+      if (!img_exit_valid) begin
+        $display("PROGRAM STOPPED at cyc=%0d (+stop_at; not a pass/fail result)", mon_cycle_q);
+        $finish;
+      end
+    end
+    while (!img_exit_valid && (mon_cycle_q < max_cycles)) @(posedge clk_i);
+    if (!img_exit_valid)
+      $fatal(1, "PROGRAM TIMEOUT: no EXIT write within %0d cycles", max_cycles);
+    $display("PROGRAM EXIT code=%0d (0x%08h) at cyc=%0d", img_exit_code, img_exit_code, mon_cycle_q);
+    if (img_exit_code != 0)
+      $fatal(1, "PROGRAM FAILED: exit code 0x%08h", img_exit_code);
+    $finish;
+  end
+`elsif MX_STREAM_TEST
   localparam int unsigned STREAM_RUN_CYCLES = 1500;
 
   initial begin
@@ -1628,7 +1719,8 @@ module tb_mxdotp_core;
   // It only reads the xif_* taps above; no scoreboard state or check uses it.
   //----------------------------------------------------------------------------
 
-  longint unsigned mon_cycle_q;
+  // (mon_cycle_q is declared next to clk_i/rst_ni at the top - mem_model's
+  // MARK register reads it too.)
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) mon_cycle_q <= '0;
@@ -1654,8 +1746,17 @@ module tb_mxdotp_core;
     endcase
   endfunction
 
+  // Long program-image runs would print thousands of lines, so there the
+  // monitor is off unless +xifmon is given. Every other build: always on.
+`ifdef MX_PROGRAM_IMAGE
+  bit mon_print_en;
+  initial mon_print_en = $test$plusargs("xifmon");
+`else
+  localparam bit mon_print_en = 1'b1;
+`endif
+
   always @(posedge clk_i) begin
-    if (rst_ni) begin
+    if (rst_ni && mon_print_en) begin
       // Only an accepted handshake is an issue. A rejected one (the core then
       // treats the instruction as illegal) is printed under its own label so
       // it is never counted as an ISSUE.

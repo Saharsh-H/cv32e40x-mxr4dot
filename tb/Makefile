@@ -392,6 +392,94 @@ $(STREAM_EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 		$(CXX_FILES)
 
 #==============================================================================
+# Compiled-program runs (make loop PROG=<name>)
+#------------------------------------------------------------------------------
+# Same system testbench, built with MX_PROGRAM_IMAGE: tb/mem_model.sv replaces
+# instr_rom.sv + data_mem_stub.sv and loads the program image named by
+# +image=. The program is sw/<PROG>/ (all .c/.S files) + sw/common/crt0.S,
+# linked at 0x0 by sw/common/link.ld. The run ends when the program writes its
+# exit code (0 = pass) to the EXIT register; +max_cycles bounds it. The
+# testbench is verilated once into build/loop and reused for every program.
+#
+#   make loop PROG=smoke                   run one program
+#   make loop PROG=x LOOP_ARGS=+xifmon     extra plusargs (+xifmon, +trace...)
+#
+# Tracing is off (+notrace) unless LOOP_TRACE=1; the VCD then lands in
+# build/loop/.
+#==============================================================================
+
+SW_DIR       := $(abspath $(TB_DIR)/../sw)
+SW_COMMON    := $(SW_DIR)/common
+SW_BUILD_DIR := $(BUILD_ROOT)/sw
+
+RV_PREFIX  := riscv64-unknown-elf-
+RV_CC      := $(RV_PREFIX)gcc
+RV_OBJCOPY := $(RV_PREFIX)objcopy
+RV_OBJDUMP := $(RV_PREFIX)objdump
+RV_CFLAGS  := -march=rv32im_zicsr -mabi=ilp32 -O2 -g -ffreestanding -nostdlib -nostartfiles -Wall -Wextra -I$(SW_COMMON) -Wl,--no-warn-rwx-segments
+
+PROG            ?= smoke
+LOOP_MAX_CYCLES ?= 2000000
+LOOP_TRACE      ?= 0
+LOOP_ARGS       ?=
+
+LOOP_BUILD_DIR        := $(BUILD_ROOT)/loop
+LOOP_EXECUTABLE       := $(LOOP_BUILD_DIR)/V$(TOP_MODULE)
+LOOP_VERILATOR_FLAGS  := $(subst --Mdir $(BUILD_DIR),--Mdir $(LOOP_BUILD_DIR),$(VERILATOR_FLAGS)) -DMX_PROGRAM_IMAGE
+LOOP_TB_SRCS          := $(TB_SRCS) $(TB_DIR)/mem_model.sv
+
+PROG_SRCS := $(wildcard $(SW_DIR)/$(PROG)/*.c $(SW_DIR)/$(PROG)/*.S)
+PROG_ELF  := $(SW_BUILD_DIR)/$(PROG).elf
+PROG_HEX  := $(SW_BUILD_DIR)/$(PROG).hex
+
+# Generated operand data: if sw/<PROG>/gen_args exists, its contents are the
+# arguments to tb/scripts/gen_loop_data.py, which writes the data + golden
+# expected words to build/sw/<PROG>_data.S (linked into the program) and a
+# JSON summary next to it.
+PROG_GEN_ARGS_FILE := $(SW_DIR)/$(PROG)/gen_args
+PROG_GEN_ARGS      := $(strip $(shell cat $(PROG_GEN_ARGS_FILE) 2>/dev/null))
+ifneq ($(PROG_GEN_ARGS),)
+PROG_GEN_S := $(SW_BUILD_DIR)/$(PROG)_data.S
+$(PROG_GEN_S): $(PROG_GEN_ARGS_FILE) $(TB_DIR)/scripts/gen_loop_data.py $(wildcard $(VERIFICATION_DIR)/*_golden.py)
+	@mkdir -p $(SW_BUILD_DIR)
+	python3 $(TB_DIR)/scripts/gen_loop_data.py $(PROG_GEN_ARGS) --out-s $@ --out-json $(SW_BUILD_DIR)/$(PROG)_expected.json
+else
+PROG_GEN_S :=
+endif
+
+ifeq ($(LOOP_TRACE),1)
+LOOP_TRACE_ARG :=
+else
+LOOP_TRACE_ARG := +notrace
+endif
+
+.PHONY: loop
+loop: $(LOOP_EXECUTABLE) $(PROG_HEX)
+	@echo
+	@echo "==============================="
+	@echo "Running program $(PROG)..."
+	@echo "==============================="
+	cd $(LOOP_BUILD_DIR) && ./V$(TOP_MODULE) +image=$(abspath $(PROG_HEX)) +max_cycles=$(LOOP_MAX_CYCLES) $(LOOP_TRACE_ARG) $(LOOP_ARGS)
+
+$(LOOP_EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(LOOP_TB_SRCS) $(CXX_FILES)
+	@mkdir -p $(LOOP_BUILD_DIR)
+	$(VERILATOR) $(LOOP_VERILATOR_FLAGS) \
+		-f $(VERILATOR_FLIST) \
+		$(MXDOTP_SRCS) \
+		$(LOOP_TB_SRCS) \
+		$(CXX_FILES)
+
+$(PROG_ELF): $(PROG_SRCS) $(PROG_GEN_S) $(wildcard $(SW_DIR)/$(PROG)/*.h) $(SW_COMMON)/crt0.S $(SW_COMMON)/link.ld $(wildcard $(SW_COMMON)/*.h)
+	@test -n "$(PROG_SRCS)" || (echo "no sources in $(SW_DIR)/$(PROG)" && false)
+	@mkdir -p $(SW_BUILD_DIR)
+	$(RV_CC) $(RV_CFLAGS) -T $(SW_COMMON)/link.ld -o $@ $(SW_COMMON)/crt0.S $(PROG_SRCS) $(PROG_GEN_S) -lgcc
+	$(RV_OBJDUMP) -d $@ > $(SW_BUILD_DIR)/$(PROG).dis
+
+$(PROG_HEX): $(PROG_ELF)
+	$(RV_OBJCOPY) -O binary $< $(SW_BUILD_DIR)/$(PROG).bin
+	python3 $(TB_DIR)/scripts/bin2hex.py $(SW_BUILD_DIR)/$(PROG).bin $@
+
+#==============================================================================
 # Utilities
 #==============================================================================
 

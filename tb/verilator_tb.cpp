@@ -19,6 +19,15 @@
 //   Verilator converts into a non-zero process exit code automatically -
 //   so `make`/CI sees failures for free, and this file never goes stale
 //   relative to the scoreboard's internal state names.
+//
+//   Time advances straight to the next scheduled event (Verilator 5 --timing:
+//   eventsPending()/nextTimeSlot()) rather than 1 ps per eval(): the design
+//   only changes at its own #delays and clock edges, so the stepped-over
+//   picoseconds never had anything to evaluate. That was ~10,000 evals per
+//   10 ns clock; long program-image runs (make loop) need the speed.
+//
+//   Plusargs:
+//     +notrace   do not write tb_mxdotp_core.vcd (default: write it, as before)
 //==============================================================================
 
 #include <verilated.h>
@@ -34,9 +43,13 @@ int main(int argc, char** argv) {
 
     Vtb_mxdotp_core* top = new Vtb_mxdotp_core{contextp};
 
-    VerilatedVcdC* tfp = new VerilatedVcdC;
-    top->trace(tfp, 99);
-    tfp->open("tb_mxdotp_core.vcd");
+    const bool trace_on = (contextp->commandArgsPlusMatch("notrace")[0] == '\0');
+    VerilatedVcdC* tfp = nullptr;
+    if (trace_on) {
+        tfp = new VerilatedVcdC;
+        top->trace(tfp, 99);
+        tfp->open("tb_mxdotp_core.vcd");
+    }
 
     printf("Verilator testbench starting...\n");
     printf("(tb_mxdotp_core.sv drives its own clock/reset and watchdog;\n"
@@ -44,20 +57,24 @@ int main(int argc, char** argv) {
 
     while (!contextp->gotFinish()) {
         top->eval();
-        tfp->dump(contextp->time());
-        contextp->timeInc(1);
+        if (tfp) tfp->dump(contextp->time());
+        if (contextp->gotFinish()) break;   // report the $finish time itself, not the next slot
+        if (!top->eventsPending()) break;   // nothing left to run - only reachable if the TB never $finishes
+        contextp->time(top->nextTimeSlot());
     }
 
     printf("\nSimulation finished at time %llu\n",
            static_cast<unsigned long long>(contextp->time()));
 
-    tfp->close();
-    delete tfp;
+    if (tfp) {
+        tfp->close();
+        delete tfp;
+    }
 
     top->final();
     delete top;
     delete contextp;
 
-    printf("Waveform written to tb_mxdotp_core.vcd\n");
+    if (trace_on) printf("Waveform written to tb_mxdotp_core.vcd\n");
     return 0;
 }

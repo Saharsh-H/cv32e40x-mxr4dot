@@ -5,7 +5,8 @@ usage (from tb/):  make full > full.log 2>&1
 
 Pairing: XIF ids are reused, so each COMMIT/RESULT is matched to the FIRST
 still-unmatched ISSUE carrying the same id (FIFO per id), never by id alone.
-REJECTED-ISSUE lines are counted separately and never paired.
+REJECTED-ISSUE lines are counted separately; their (kill=1) commits are
+consumed by a placeholder, and they never get a result.
 """
 import re
 import sys
@@ -22,7 +23,11 @@ for line in open(sys.argv[1]):
         continue
     cyc, kind, iid, rest = int(m[1]), m[2], int(m[3]), m[4]
     if kind == 'REJECTED-ISSUE':
+        # Rejected offloads (e.g. the core offering its CSR instructions) still
+        # get a commit (kill=1) and never a result: queue a placeholder so that
+        # commit is consumed in order and does not pair with a real issue.
         rejected += 1
+        open_commit[iid].append(dict(rejected=True))
     elif kind == 'ISSUE':
         name = rest.split()[0]
         rd = re.search(r'rd=(x\d+)', rest)[1]

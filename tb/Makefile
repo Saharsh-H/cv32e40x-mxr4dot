@@ -82,6 +82,24 @@ TOP_MODULE    := tb_mxdotp_core
 MANIFEST      := $(ROOT_DIR)/cv32e40x_manifest.flist
 VERILATOR_FLIST := $(BUILD_DIR)/verilator.f
 
+# Core RTL files the generated filelist names (same filter as the
+# $(VERILATOR_FLIST) rule below). Every build that reads that filelist lists
+# them as prerequisites: a file reached only through -f is not one, so an
+# edit to it would not rebuild the simulator (found 22 Oct 2026, MXR4DOT
+# question 10 fix) - the same rule as for MXDOTP_SHARED_SRCS below.
+CORE_SRCS := $(shell sed 's|$${DESIGN_RTL_DIR}|$(RTL_DIR)|g' $(MANIFEST) | \
+	grep -v '^[[:space:]]*+' | grep -v '^[[:space:]]*//' | grep '\.sv' | \
+	grep -v "cv32e40x_wrapper.sv" | grep -v "cv32e40x_rvfi.sv" | \
+	grep -v "cv32e40x_rvfi_pkg.sv" | grep -v "/sva/")
+
+# This Makefile is a prerequisite of every simulator and of the filelist, so a
+# change to the Verilator flags, the filelist filter or the source lists
+# rebuilds them (side effect: any edit here rebuilds everything). Each
+# simulator recipe ends with `touch $@`: when Verilator finds its generated
+# code unchanged it does not relink, the binary keeps its old timestamp and
+# would otherwise look out of date forever.
+THIS_MAKEFILE := $(TB_DIR)/Makefile
+
 #==============================================================================
 # make full (default) - full system regression
 #------------------------------------------------------------------------------
@@ -192,7 +210,7 @@ EXECUTABLE := $(BUILD_DIR)/V$(TOP_MODULE)
 # Build manifest for Verilator
 #----------------------------------------------------------------------------
 
-$(VERILATOR_FLIST): $(MANIFEST)
+$(VERILATOR_FLIST): $(MANIFEST) $(THIS_MAKEFILE)
 	@mkdir -p $(BUILD_DIR)
 	@echo "Generating Verilator file list..."
 	@sed 's|$${DESIGN_RTL_DIR}|$(abspath $(RTL_DIR))|g' $(MANIFEST) | \
@@ -217,12 +235,13 @@ full: $(EXECUTABLE)
 # see the comment block above this section for why.
 all: full
 
-$(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
+$(EXECUTABLE): $(VERILATOR_FLIST) $(CORE_SRCS) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES) $(THIS_MAKEFILE)
 	$(VERILATOR) $(VERILATOR_FLAGS) \
 		-f $(VERILATOR_FLIST) \
 		$(MXDOTP_SRCS) \
 		$(TB_SRCS) \
 		$(CXX_FILES)
+	@touch $@
 
 #==============================================================================
 # Standalone unit-engine testbenches (make fp4, make fp8, ...)
@@ -345,12 +364,13 @@ $(1): $(1)-vectors $$($(1)_EXECUTABLE)
 # fails the same way; it only succeeds once build/units/ already exists and
 # just the leaf is missing). The system build's $(VERILATOR_FLIST) rule
 # already had this covered (mkdir -p $(BUILD_DIR)); this template didn't.
-$$($(1)_EXECUTABLE): $(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
+$$($(1)_EXECUTABLE): $(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC) $(THIS_MAKEFILE)
 	@mkdir -p $$($(1)_BUILD_DIR)
 	$(VERILATOR) $(UNIT_VERILATOR_FLAGS) \
 		--top-module $$($(1)_TOP) \
 		--Mdir $$($(1)_BUILD_DIR) \
 		$(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
+	@touch $$@
 
 endef
 
@@ -383,13 +403,14 @@ stream: $(STREAM_EXECUTABLE)
 	@echo "==============================="
 	cd $(STREAM_BUILD_DIR) && ./V$(TOP_MODULE)
 
-$(STREAM_EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
+$(STREAM_EXECUTABLE): $(VERILATOR_FLIST) $(CORE_SRCS) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES) $(THIS_MAKEFILE)
 	@mkdir -p $(STREAM_BUILD_DIR)
 	$(VERILATOR) $(STREAM_VERILATOR_FLAGS) \
 		-f $(VERILATOR_FLIST) \
 		$(MXDOTP_SRCS) \
 		$(TB_SRCS) \
 		$(CXX_FILES)
+	@touch $@
 
 #==============================================================================
 # Compiled-program runs (make loop PROG=<name>)
@@ -461,13 +482,14 @@ loop: $(LOOP_EXECUTABLE) $(PROG_HEX)
 	@echo "==============================="
 	cd $(LOOP_BUILD_DIR) && ./V$(TOP_MODULE) +image=$(abspath $(PROG_HEX)) +max_cycles=$(LOOP_MAX_CYCLES) $(LOOP_TRACE_ARG) $(LOOP_ARGS)
 
-$(LOOP_EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(LOOP_TB_SRCS) $(CXX_FILES)
+$(LOOP_EXECUTABLE): $(VERILATOR_FLIST) $(CORE_SRCS) $(MXDOTP_SRCS) $(LOOP_TB_SRCS) $(CXX_FILES) $(THIS_MAKEFILE)
 	@mkdir -p $(LOOP_BUILD_DIR)
 	$(VERILATOR) $(LOOP_VERILATOR_FLAGS) \
 		-f $(VERILATOR_FLIST) \
 		$(MXDOTP_SRCS) \
 		$(LOOP_TB_SRCS) \
 		$(CXX_FILES)
+	@touch $@
 
 $(PROG_ELF): $(PROG_SRCS) $(PROG_GEN_S) $(wildcard $(SW_DIR)/$(PROG)/*.h) $(SW_COMMON)/crt0.S $(SW_COMMON)/link.ld $(wildcard $(SW_COMMON)/*.h)
 	@test -n "$(PROG_SRCS)" || (echo "no sources in $(SW_DIR)/$(PROG)" && false)

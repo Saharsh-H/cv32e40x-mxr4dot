@@ -219,51 +219,160 @@ def model_shapes(cfg):
                 params=sum(k * n for k, n in gemv) + bias + norms + v * h + (0 if tied else v * h) + pos_emb)
 
 
-def regime_b(paths, ctxs, bws):
-    print('REGIME B - analytic batch-1 decode model, NOT this system: compute is ASSUMED not to')
-    print('limit; every weight byte is streamed from DRAM once per token. Bytes per token is the')
-    print('primary result; tokens/s at the given bandwidths are ILLUSTRATIVE only.\n')
+# eval v2 result layout (run_eval.py): <eval_dir>/language/<model_name with / -> __>/<mode>.json,
+# key 'ppl' = WikiText-2 perplexity. Config file stem -> model folder; format -> eval quant_mode.
+EVAL_MODEL_DIRS = {'gpt2': 'gpt2', 'llama2_7b': 'meta-llama__Llama-2-7b-hf',
+                   'mistral_7b': 'mistralai__Mistral-7B-v0.1', 'llama3_8b': 'meta-llama__Meta-Llama-3-8B'}
+EVAL_MODES = {'BF16': 'bf16', 'MXFP8-E4M3': 'mxfp8_e4m3', 'MXFP4': 'mxfp4', 'NVFP4': 'nvfp4',
+              'M2XFP4': 'm2xfp', 'MXFP4R (residue A)': 'mxfp4_residual_act_only',
+              'MXFP4R (residue W)': 'mxfp4_residual_weight_only', 'MXFP4R (residue both)': 'mxfp4_residual'}
+# the MXFP4R variant eval v2 evaluates by default (frameworks/language.py "MXFP4R default",
+# ci_report.py --ref) and the one the hardware implements; the other two are alternatives
+MXFP4R_HEADLINE = 'MXFP4R (residue A)'
+
+
+B_CAVEAT = ('Regime B: analytic batch-1 decode model, not this system. Compute is assumed not to limit; every '
+            'weight byte is streamed from DRAM once per token; the KV cache is BF16 for every format; '
+            'tokens/s are illustrative only. Not regime A.')
+
+
+def print_table(title, head, rows, md):
+    if md:
+        print(f'\n**{title}**\n')
+        print('| ' + ' | '.join(head) + ' |')
+        print('|' + '---|' * len(head))
+        for row in rows:
+            print('| ' + ' | '.join(str(x) for x in row) + ' |')
+    else:
+        print(f'\n{title}')
+        w = [max(len(str(x)) for x in col) for col in zip(head, *rows)]
+        for row in [head] + rows:
+            print('  '.join(str(x).rjust(c) for x, c in zip(row, w)))
+
+
+def read_ci(paths):
+    """ci_report.py Markdown (eval v2, unchanged script) -> {ref: {model_dir: {mode: (diff, ci, excl)}}}."""
+    import re
+    out = {}
+    for p in paths or []:
+        model = ref = None
+        for line in open(p):
+            m = re.match(r'### (\S+)', line)
+            if m:
+                model = m[1]
+                continue
+            m = re.match(r'\| mode \|.*\| diff vs (\S+) \|', line)
+            if m:
+                ref = m[1]
+                continue
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            if model and ref and len(cells) == 6 and cells[0] not in ('mode', '---'):
+                out.setdefault(ref, {}).setdefault(model, {})[cells[0]] = (cells[3], cells[4], cells[5], p)
+    return out
+
+
+def model_bytes(cfg, ctx_list):
+    sh = model_shapes(cfg)
+    n_w = sum(k * n for k, n in sh['gemv'])
+    n_a = sum(k for k, _ in sh['gemv'])
+    other = 2 * (sh['lm_head'] + sh['embed_row'] + sh['bias'] + sh['norms'])
+    cols = [min(c, sh['max_pos']) for c in ctx_list]
+    if sh['window'] and any(c > sh['window'] for c in cols):
+        raise NotImplementedError('context beyond the sliding window: KV read would be capped')
+    tot = {f: [n_w * bw_ / 8 + n_a * ba_ / 8 + other + 2 * sh['kv_per_ctx'] * c for c in cols]
+           for f, bw_, ba_, _ in FORMATS}
+    act = {f: n_a * ba_ / 8 for f, _, ba_, _ in FORMATS}
+    return sh, n_w, n_a, other, cols, tot, act
+
+
+def label(fname):
+    return fname + (' (headline)' if fname == MXFP4R_HEADLINE else (' (alternative)' if fname.startswith('MXFP4R') else ''))
+
+
+def regime_b(paths, ctxs, bws, md=False, eval_dir=None, acc_ctx=512, index_dir=None, ci_files=None):
+    import os
+    print(B_CAVEAT)
+    ctx_list = [0] + ctxs
+    ci = read_ci(ci_files)
+    summary = []
     for p in paths:
         cfg = json.load(open(p))
-        sh = model_shapes(cfg)
-        n_w = sum(k * n for k, n in sh['gemv'])
-        n_a = sum(k for k, _ in sh['gemv'])
-        bf16_other = 2 * (sh['lm_head'] + sh['embed_row'] + sh['bias'] + sh['norms'])
-        name = cfg.get('_name_or_path') or p
-        print(f'== {name}  ({p})')
-        print(f'   parameters computed from config: {sh["params"]:,}; lm_head tied to the embedding: '
-              f'{sh["tied"]} (lm_head matrix counted once per token, plus one embedding row'
-              f'{" + one position row" if cfg.get("model_type") == "gpt2" else ""} read per token)')
-        print(f'   attention heads {sh["nh"]}, KV heads {sh["nkv"]}, head_dim {sh["head_dim"]}'
-              + (f', sliding window {sh["window"]}' if sh['window'] else ''))
-        print(f'   quantised linear weights {n_w:,} elements; GEMV input elements per token {n_a:,} '
-              f'(activation/weight = 1/{n_w / n_a:,.0f}); BF16 lm_head+embedding row(s)+biases+norms '
-              f'{bf16_other:,} B/token; KV (BF16) {2 * sh["kv_per_ctx"]:,} B per token of context; '
-              f'max context {sh["max_pos"]}')
-        cols = [0] + [min(c, sh['max_pos']) for c in ctxs]
-        if sh['window'] and any(c > sh['window'] for c in cols):
-            raise NotImplementedError('context beyond the sliding window: KV read would be capped')
-        for c_req, c in zip([0] + ctxs, cols):
-            if c != c_req:
-                print(f'   note: context {c_req} clamped to {c} (model maximum)')
-        print(f'   {"format":24}{"b_w":>6}{"b_a":>6}' + ''.join(f'{"B/token L=" + str(c):>18}' for c in cols)
-              + f'{"act B/tok":>11}{"act share":>10}' + ''.join(f'{"vs MXFP8 L=" + str(c):>16}' for c in cols))
-        rows = {}
-        for fname, bw_, ba_, _ in FORMATS:
-            w_b, a_b = n_w * bw_ / 8, n_a * ba_ / 8
-            tot = [w_b + a_b + bf16_other + 2 * sh['kv_per_ctx'] * c for c in cols]
-            rows[fname] = (tot, a_b / tot[0], a_b)
-        for fname, bw_, ba_, _ in FORMATS:
-            tot, share, a_b = rows[fname]
-            ref = rows['MXFP8-E4M3'][0]
-            print(f'   {fname:24}{bw_:6.2f}{ba_:6.2f}' + ''.join(f'{t:18,.0f}' for t in tot)
-                  + f'{a_b:11,.0f}{100 * share:9.3f}%' + ''.join(f'{r / t:16.3f}' for r, t in zip(ref, tot)))
-        print(f'   illustrative tokens/s (bandwidth / bytes per token) at L={cols[0]} and L={cols[-1]}:')
-        for fname, *_ in FORMATS:
-            tot = rows[fname][0]
-            print(f'   {fname:24}' + ''.join(f'{b / 1e9:6.1f} GB/s: {b / tot[0]:8.2f} | {b / tot[-1]:8.2f} tok/s   '
-                                         for b in bws))
-        print()
+        stem = os.path.splitext(os.path.basename(p))[0]
+        sh, n_w, n_a, other, cols, tot, act = model_bytes(cfg, ctx_list)
+        ref = tot['MXFP8-E4M3']
+        clamp = [f'{c_req} clamped to {c}' for c_req, c in zip(ctx_list, cols) if c != c_req]
+        print(f'\n### {stem}  ({p})\n' if md else f'\n== {stem}  ({p})')
+        print(f'Parameters (from config) {sh["params"]:,}; lm_head tied to the embedding: {sh["tied"]}; '
+              f'attention heads {sh["nh"]}, KV heads {sh["nkv"]}, head_dim {sh["head_dim"]}'
+              + (f', sliding window {sh["window"]}' if sh['window'] else '')
+              + f'; KV cache (BF16) {2 * sh["kv_per_ctx"]:,} B per token of context; max context {sh["max_pos"]}'
+              + (f' ({"; ".join(clamp)})' if clamp else '') + '.')
+        print(f'Per token: quantised linear weights {n_w:,} elements; GEMV input elements {n_a:,}; BF16 '
+              f'lm_head + embedding row(s) + biases + norms {other:,} B (lm_head alone {2 * sh["lm_head"]:,} B).')
+        head = ['format', 'b_w', 'b_a'] + [f'B/token L={c}' for c in cols] + ['act B/token', 'act share (L=0)'] \
+            + [f'MXFP8 ÷ format L={c}' for c in cols]
+        rows = [[label(f), f'{bw_:.2f}', f'{ba_:.2f}'] + [f'{t:,.0f}' for t in tot[f]]
+                + [f'{act[f]:,.0f}', f'{100 * act[f] / tot[f][0]:.3f}%'] + [f'{r / t:.3f}' for r, t in zip(ref, tot[f])]
+                for f, bw_, ba_, _ in FORMATS]
+        print_table(f'B1 {stem}: bytes per token by context length L ({B_CAVEAT.split(".")[0]})', head, rows, md)
+        head = ['format'] + [f'{b / 1e9:g} GB/s, L={c}' for b in bws for c in (cols[0], cols[-1])]
+        rows = [[label(f)] + [f'{b / tot[f][i]:.2f}' for b in bws for i in (0, -1)] for f, *_ in FORMATS]
+        print_table(f'B2 {stem}: ILLUSTRATIVE tokens/s = bandwidth / bytes per token (not a prediction)', head, rows, md)
+        if eval_dir:
+            c = min(acc_ctx, sh['max_pos'])
+            i = cols.index(c) if c in cols else None
+            t512 = {f: tot[f][i] for f in tot} if i is not None else model_bytes(cfg, [c])[5]
+            t512 = {f: (v if not isinstance(v, list) else v[0]) for f, v in t512.items()}
+            mdir = EVAL_MODEL_DIRS.get(stem)
+            head = ['format', f'B/token L={c}', 'MXFP8 ÷ format', 'PPL', 'seq_len',
+                    f'Δ PPL vs {EVAL_MODES[MXFP4R_HEADLINE]} [95% CI]', 'sig', 'Δ PPL vs mxfp8_e4m3 [95% CI]', 'sig',
+                    'PPL source (path : key)']
+            rows = []
+            for f, *_ in FORMATS:
+                mode = EVAL_MODES[f]
+                fp = os.path.join(eval_dir, 'language', mdir, mode + '.json') if mdir else None
+                if fp and os.path.exists(fp):
+                    r = json.load(open(fp))
+                    ppl, sl, src = f'{r["ppl"]:.4g}', r['seq_len'], f'`{fp}` : `ppl`'
+                else:
+                    ppl, sl, src = '[DATA: missing]', '', '[DATA: missing]'
+                cells = []
+                for rf in (EVAL_MODES[MXFP4R_HEADLINE], 'mxfp8_e4m3'):
+                    e = ci.get(rf, {}).get(mdir, {}).get(mode)
+                    cells += ([f'{e[0]} {e[1]}', e[2]] if e and e[0] != '—' else (['ref', ''] if e else ['[DATA: missing]', '']))
+                rows.append([label(f), f'{t512[f]:,.0f}', f'{t512["MXFP8-E4M3"] / t512[f]:.3f}', ppl, sl] + cells + [src])
+            print_table(f'B3 {stem}: bytes per token at L={c} paired with WikiText-2 perplexity (eval v2) and paired '
+                        f'bootstrap CIs (eval v2 ci_report.py; Δ = mode − reference; sig = CI excludes 0)', head, rows, md)
+            srcs = sorted({e[3] for rf in ci.values() for m in rf.values() for e in m.values()})
+            if srcs:
+                print('\nCI sources: ' + ', '.join(f'`{s}`' for s in srcs))
+        r_a, mx4 = tot[MXFP4R_HEADLINE], tot['MXFP4']
+        summary.append([stem, sh['nkv'], f'{2 * sh["kv_per_ctx"]:,}',
+                        f'{100 * (r_a[1] - mx4[1]) / mx4[1]:.3f}%',
+                        f'{100 * (tot["NVFP4"][1] - r_a[1]) / tot["NVFP4"][1]:.2f}%',
+                        f'{100 * (tot["M2XFP4"][1] - r_a[1]) / tot["M2XFP4"][1]:.2f}%',
+                        f'{100 * 2 * sh["lm_head"] / r_a[1]:.1f}%']
+                       + [f'{ref[i] / r_a[i]:.3f} (L={cols[i]})' for i in range(len(cols))])
+    print_table(f'B4 summary at L={ctx_list[1]} unless stated ({MXFP4R_HEADLINE} = MXFP4R)',
+                ['model', 'KV heads', 'KV B per ctx token', 'MXFP4R − MXFP4 bytes', 'MXFP4R fewer bytes than NVFP4',
+                 'than M2XFP4', 'BF16 lm_head share of MXFP4R bytes'] + ['MXFP8 ÷ MXFP4R, L=0'] + [f'MXFP8 ÷ MXFP4R, L={c} (or max)' for c in ctx_list[1:]],
+                summary, md)
+    if index_dir:
+        rows = []
+        for p in paths:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            comp = model_shapes(json.load(open(p)))['params']
+            f = os.path.join(index_dir, stem + '.index.json')
+            if not os.path.exists(f):
+                rows.append([stem, f'{comp:,}', '(no index file)', '', ''])
+                continue
+            d = json.load(open(f))
+            n = d['metadata']['total_size'] // 2
+            bufs = [k for k in d['weight_map'] if k.endswith('inv_freq')]
+            rows.append([stem, f'{comp:,}', f'{n:,}', f'{n - comp:+,}',
+                         f'{len(bufs)} rotary inv_freq buffers in the checkpoint' if bufs else ''])
+        print_table('B5 parameter check: computed from config vs checkpoint index metadata.total_size / 2 '
+                    '(2-byte parameters)', ['model', 'computed', 'index / 2', 'diff', 'note'], rows, md)
 
 
 def main():
@@ -276,11 +385,17 @@ def main():
     b.add_argument('configs', nargs='+')
     b.add_argument('--ctx', default='512,4096')
     b.add_argument('--bw', default='17e9,50e9')
+    b.add_argument('--eval-dir', help='eval v2 results (language/<model>/<mode>.json): pair PPL with bytes/token')
+    b.add_argument('--acc-ctx', type=int, default=512, help='context length for the accuracy pairing')
+    b.add_argument('--index-dir', help='checkpoint *.index.json files: parameter-count check')
+    b.add_argument('--ci', nargs='*', help='ci_report.py Markdown outputs (paired bootstrap CIs) to join')
+    b.add_argument('--md', action='store_true', help='Markdown tables')
     args = ap.parse_args()
     if args.cmd == 'regime-a':
         regime_a(args.loops, args.md)
     else:
-        regime_b(args.configs, [int(x) for x in args.ctx.split(',')], [float(x) for x in args.bw.split(',')])
+        regime_b(args.configs, [int(x) for x in args.ctx.split(',')], [float(x) for x in args.bw.split(',')],
+                 md=args.md, eval_dir=args.eval_dir, acc_ctx=args.acc_ctx, index_dir=args.index_dir, ci_files=args.ci)
 
 
 if __name__ == '__main__':

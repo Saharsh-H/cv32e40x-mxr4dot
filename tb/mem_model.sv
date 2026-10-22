@@ -40,6 +40,10 @@
 //   rvalid timing relative to the grant is unchanged (+dwait still applies on
 //   top if both are given). Instruction port unaffected. n = 0: original
 //   behaviour.
+//
+//   +gcount (default off): with every MARK also print
+//   "[GNT] mark=<id> data_grants=<n>", n = data-port grants so far including
+//   the MARK store's own. Used by make q10 to count grants per region.
 //==============================================================================
 
 module mem_model #(
@@ -130,9 +134,12 @@ module mem_model #(
   localparam int unsigned DQ_DEPTH = 4;   // responses in flight; the LSU keeps far fewer outstanding
 
   int unsigned dwait, dgnt;
+  bit          gcount;
+  longint unsigned dgrants;               // data grants so far (+gcount)
   initial begin
     if (!$value$plusargs("dwait=%d", dwait)) dwait = 0;
     if (!$value$plusargs("dgnt=%d", dgnt)) dgnt = 0;
+    gcount = $test$plusargs("gcount");
     if (dwait != 0)
       $display("mem_model: data-port response latency +%0d cycle(s) per access (+dwait); instruction port ideal", dwait);
     if (dgnt != 0)
@@ -164,6 +171,7 @@ module mem_model #(
       exit_valid_q <= 1'b0;
       exit_code_q  <= '0;
       gnt_hold     <= 0;
+      dgrants      <= 0;
     end else begin
       // +dgnt: a grant blocks the next dgnt cycles
       if (data_req_i && data_gnt_o) gnt_hold <= dgnt;
@@ -181,6 +189,7 @@ module mem_model #(
         dq_wait[dq_tail] <= dwait;
         dq_data[dq_tail] <= '0;
         dq_tail          <= dq_tail + 1'b1;
+        dgrants          <= dgrants + 1;
         if (in_ram(data_addr_i)) begin
           if (data_we_i) begin
             for (int b = 0; b < 4; b++)
@@ -198,6 +207,7 @@ module mem_model #(
           $display("[SW] 0x%08h", data_wdata_i);
         end else if (data_we_i && (data_addr_i == MMIO_MARK)) begin
           $display("[MARK %0d] cyc=%0d", data_wdata_i, cycle_i);
+          if (gcount) $display("[GNT] mark=%0d data_grants=%0d", data_wdata_i, dgrants + 1);
         end else if (!data_we_i && (data_addr_i >= MMIO_BASE) && (data_addr_i < MMIO_BASE + 32'hC)) begin
           dq_data[dq_tail] <= '0;
         end else begin

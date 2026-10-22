@@ -232,6 +232,21 @@ module cv32e40x_controller_bypass import cv32e40x_pkg::*;
   // Stall EX if offloaded instruction in WB may trigger an exception
   assign ctrl_byp_o.xif_exception_stall = ex_wb_pipe_i.xif_en && ex_wb_pipe_i.xif_meta.exception && ex_wb_pipe_i.instr_valid;
 
+  // Stall EX while a load/store is in EX and an offloaded instruction is in WB.
+  // The LSU issues from EX regardless of wb_ready: while an offloaded instruction waits in WB for
+  // its XIF result, the load/store in EX would re-request every cycle (no "already issued" state),
+  // and the outstanding re-requests hold the LSU's ready_1_o (and so wb_ready) low in the cycle the
+  // result arrives. result_ready does not depend on wb_ready, so that result would be accepted and
+  // lost, and WB would wait forever (MXR4DOT question 10). Halting EX keeps cnt_q at 0, so WB retires
+  // the offloaded instruction in its result cycle; the load/store issues in the next cycle.
+  // Only pipeline-register bits: no path from data_rvalid/data_gnt/result_valid, and the stall is
+  // already set in the load/store's first EX cycle and only falls, so no raised request is withdrawn.
+  // Rejected offloads reach WB with xif_en = 0 (kill_xif), so they do not stall.
+  // Assumes the coprocessor never uses the XIF memory interface (issue_resp.loadstore = 0, as in
+  // mxdotp_xif.sv); an offloaded instruction that itself uses the LSU would need its own analysis.
+  assign ctrl_byp_o.xif_lsu_stall = id_ex_pipe_i.lsu_en && id_ex_pipe_i.instr_valid &&
+                                    ex_wb_pipe_i.xif_en && ex_wb_pipe_i.instr_valid;
+
   // Forwarding control unit for rs3 (XIF's 3rd read port, e.g. R4-type instructions).
   //
   // This only exists when REGFILE_NUM_READ_PORTS >= 3 - unlike rs1/rs2 (indices 0/1,

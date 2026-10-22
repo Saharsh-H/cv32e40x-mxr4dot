@@ -480,6 +480,32 @@ $(PROG_HEX): $(PROG_ELF)
 	python3 $(TB_DIR)/scripts/bin2hex.py $(SW_BUILD_DIR)/$(PROG).bin $@
 
 #==============================================================================
+# q10 regression (make q10)
+#------------------------------------------------------------------------------
+# sw/q10_isolation (lw;lw and mxfused;lw;lw, 3 times each) on the program-image
+# build at every data-port setting below. Each run must exit 0 and grant exactly
+# one data access per load in both cases (counted by mem_model.sv +gcount at
+# the MARKs; tb/scripts/q10_check.py). Guards the CV32E40X EX halt for a
+# load/store in EX behind an offloaded instruction in WB (xif_lsu_stall):
+# without it the load re-requests every cycle and, at read latency 1, the
+# offloaded instruction's XIF result is lost and WB hangs.
+#==============================================================================
+
+Q10_SETTINGS := dwait=0 dwait=1 dwait=2 dwait=3 dwait=4 dwait=5 dgnt=1 dgnt=3
+Q10_DIR      := $(BUILD_ROOT)/q10
+
+.PHONY: q10
+q10: $(LOOP_EXECUTABLE)
+	$(MAKE) --no-print-directory PROG=q10_isolation $(SW_BUILD_DIR)/q10_isolation.hex
+	@mkdir -p $(Q10_DIR)
+	@for s in $(Q10_SETTINGS); do \
+	  echo "q10_isolation +$$s"; \
+	  (cd $(LOOP_BUILD_DIR) && ./V$(TOP_MODULE) +image=$(abspath $(SW_BUILD_DIR)/q10_isolation.hex) \
+	    +max_cycles=20000 +notrace +gcount +$$s) > $(Q10_DIR)/$$s.log 2>&1; \
+	done
+	python3 $(TB_DIR)/scripts/q10_check.py $(addprefix $(Q10_DIR)/,$(addsuffix .log,$(Q10_SETTINGS)))
+
+#==============================================================================
 # Utilities
 #==============================================================================
 

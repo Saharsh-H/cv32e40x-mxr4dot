@@ -1161,6 +1161,7 @@ typedef struct packed {
   logic         minstret_stall;         // Stall due to minstret/h read in EX
   logic         deassert_we;            // Deassert write enable and special insn bits
   logic         xif_exception_stall;    // Stall (EX) if xif insn in WB can cause an exception
+  logic         xif_lsu_stall;          // Stall (EX) if a load/store is in EX while an xif insn is in WB
 } ctrl_byp_t;
 
 // Controller FSM outputs

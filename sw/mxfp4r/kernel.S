@@ -21,15 +21,22 @@
  * x30/x31/x23 scratch; x9 scale word; accumulators x8 (NACC=1) or
  * x8/x18/x20/x22 (NACC=4); operands set 0 A x10/x11 W x12/x13 AR x14/x15,
  * set 1 A x16/x17 W x24/x25 AR x26/x27. All of s0-s11 are saved. nacc4's
- * acc_out (a5 = x15) is kept on the stack.
+ * acc_out (a5 = x15) is kept on the stack. *
+ * MX followed by a non-memory instruction: CV32E40X halts a load/store in EX while
+ * an offloaded instruction waits in WB (xif_lsu_stall, MXR4DOT question 10), so a
+ * load directly behind an MX instruction issues one cycle after its result. The
+ * MX instruction that would otherwise be followed by the next load is followed by
+ * a pSA addi moved up from the loop tail instead (the second block's SA offset
+ * compensates).
  */
 
 #define MXRESDOT(rs1, rs2, rs3)          .insn r4 0x0B, 0, 1, x0, rs1, rs2, rs3
 #define MXFINAL(rd, rs1_scales, rs2_acc) .insn r4 0x0B, 1, 1, rd, rs1_scales, rs2_acc, x0
 
 /* One block = 2 groups. off = byte offset of the block's first group in
- * A/W/AR; sidx = its scale index; d0/d1 = accumulators of the two groups. */
-.macro BLOCKR off, sidx, d0, d1
+ * A/W/AR; sidxa = offset of its SA scale byte from x28, sidx = offset of its
+ * SAR / SW scale bytes from x29 / x19; d0/d1 = accumulators of the two groups. */
+.macro BLOCKR off, sidxa, sidx, d0, d1
   lw    x10, \off+0(x5)
   lw    x11, \off+4(x5)
   lw    x12, \off+0(x6)
@@ -42,7 +49,7 @@
   lw    x25, \off+12(x6)
   lw    x26, \off+8(x7)
   lw    x27, \off+12(x7)
-  lbu   x30, \sidx(x28)
+  lbu   x30, \sidxa(x28)
   lbu   x31, \sidx(x29)
   lbu   x23, \sidx(x19)
   slli  x30, x30, 24
@@ -106,7 +113,6 @@
   addi  x5, x5, 32
   addi  x6, x6, 32
   addi  x7, x7, 32
-  addi  x28, x28, 2
   addi  x29, x29, 2
   addi  x19, x19, 2
   bne   x28, x21, 1b
@@ -118,8 +124,9 @@
 mxfp4r_dot_nacc1:
   PROLOGUE
 1:
-  BLOCKR  0, 0, x8, x8
-  BLOCKR 16, 1, x8, x8
+  BLOCKR  0, 0, 0, x8, x8
+  addi  x28, x28, 2         /* pSA += 2, moved up from ADVANCE: non-memory instruction after the mxfinal (q10) */
+  BLOCKR 16, -1, 1, x8, x8
   ADVANCE
   mv    a0, x8
   EPILOGUE
@@ -129,8 +136,9 @@ mxfp4r_dot_nacc1:
 mxfp4r_dot_nacc4:
   PROLOGUE
 1:
-  BLOCKR  0, 0, x8,  x18
-  BLOCKR 16, 1, x20, x22
+  BLOCKR  0, 0, 0, x8,  x18
+  addi  x28, x28, 2         /* pSA += 2, moved up from ADVANCE: non-memory instruction after the mxfinal (q10) */
+  BLOCKR 16, -1, 1, x20, x22
   ADVANCE
   lw    x30, 48(sp)
   sw    x8,  0(x30)

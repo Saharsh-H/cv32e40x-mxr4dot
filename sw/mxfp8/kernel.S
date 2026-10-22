@@ -28,7 +28,12 @@
  * operand are loaded at least 4 instructions before their mxfused; within
  * the second half of a block the low words are loaded last, so only base-port
  * forwarding can be involved (dual-read companion forwarding is only proven
- * EX->ID; handoff_project limitation 7).
+ * EX->ID; handoff_project limitation 7). *
+ * MX followed by a non-memory instruction: CV32E40X halts a load/store in EX while
+ * an offloaded instruction waits in WB (xif_lsu_stall, MXR4DOT question 10), so a
+ * load directly behind an MX instruction issues one cycle after its result. The
+ * MX instruction that would otherwise be followed by the next load is followed by
+ * a pSA addi moved up from the loop tail instead.
  */
 
 #define MXFUSED_MXFP8(rd, rs1, rs2, rs3)  .insn r4 0x0B, 3, 3, rd, rs1, rs2, rs3
@@ -55,6 +60,7 @@
   .endif
   MXFUSED_MXFP8(\d0, x10, x12, \d0)
   MXFUSED_MXFP8(\d1, x14, x16, \d1)
+  addi  x7, x7, 1           /* pSA += 1, moved up from the loop tail: non-memory instruction after the MX (q10) */
   lw    x11, 20(x5)
   lw    x13, 20(x6)
   lw    x10, 16(x5)
@@ -111,7 +117,6 @@ mxfp8_dot_nacc1:
   BLOCK8 x8, x9, x8, x9, x8, x9, x8, x9
   addi  x5, x5, 32
   addi  x6, x6, 32
-  addi  x7, x7, 1
   addi  x28, x28, 1
   bne   x7, x29, 1b
   mv    a0, x8
@@ -125,7 +130,6 @@ mxfp8_dot_nacc4:
   BLOCK8 x8, x9, x18, x19, x20, x21, x22, x23
   addi  x5, x5, 32
   addi  x6, x6, 32
-  addi  x7, x7, 1
   addi  x28, x28, 1
   bne   x7, x29, 1b
   lw    x30, 32(sp)

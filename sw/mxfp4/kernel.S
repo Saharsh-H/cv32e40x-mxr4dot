@@ -30,14 +30,22 @@
  * the mxfused that reads it, so no load result is forwarded straight into the
  * coprocessor issue (dual-read forwarding is only proven EX->ID; see
  * CURRENT_STATE / handoff_project limitation 7).
+ *
+ * MX followed by a non-memory instruction: CV32E40X halts a load/store in EX while
+ * an offloaded instruction waits in WB (xif_lsu_stall, MXR4DOT question 10), so a
+ * load directly behind an MX instruction issues one cycle after its result. The
+ * MX instruction that would otherwise be followed by the next block's first lw is
+ * followed by a loop-pointer addi moved up from the loop tail instead (the later
+ * block's scale offset compensates).
  */
 
 #define MXFUSED_MXFP4(rd, rs1, rs2, rs3)  .insn r4 0x0B, 3, 0, rd, rs1, rs2, rs3
 
 /* One block = 2 instructions. off = byte offset of the block's first
- * instruction in A/W; sidx = index of its scale byte; d0/d1 = accumulators of
- * the two instructions; s0r/s1r = the scale registers of those pairs. */
-.macro BLOCK off, sidx, d0, s0r, d1, s1r
+ * instruction in A/W; sidxa / sidxw = offsets of its A / W scale bytes from pSA
+ * (x7) / pSW (x28); d0/d1 = accumulators of the two instructions; s0r/s1r = the
+ * scale registers of those pairs. */
+.macro BLOCK off, sidxa, sidxw, d0, s0r, d1, s1r
   lw    x10, \off+0(x5)
   lw    x11, \off+4(x5)
   lw    x12, \off+0(x6)
@@ -46,8 +54,8 @@
   lw    x15, \off+12(x5)
   lw    x16, \off+8(x6)
   lw    x17, \off+12(x6)
-  lbu   x30, \sidx(x7)
-  lbu   x31, \sidx(x28)
+  lbu   x30, \sidxa(x7)
+  lbu   x31, \sidxw(x28)
   slli  x31, x31, 8
   or    \s0r, x30, x31
   .ifnc \s1r, \s0r
@@ -99,11 +107,11 @@
 mxfp4_dot_nacc1:
   PROLOGUE
 1:
-  BLOCK  0, 0, x8, x9, x8, x9
-  BLOCK 16, 1, x8, x9, x8, x9
+  BLOCK  0, 0, 0, x8, x9, x8, x9
+  addi  x7, x7, 2           /* moved up: non-memory instruction after the MX pair */
+  BLOCK 16, -1, 1, x8, x9, x8, x9
   addi  x5, x5, 32
   addi  x6, x6, 32
-  addi  x7, x7, 2
   addi  x28, x28, 2
   bne   x7, x29, 1b
   mv    a0, x8
@@ -114,11 +122,11 @@ mxfp4_dot_nacc1:
 mxfp4_dot_nacc4:
   PROLOGUE
 1:
-  BLOCK  0, 0, x8,  x9,  x18, x19
-  BLOCK 16, 1, x20, x21, x22, x23
+  BLOCK  0, 0, 0, x8,  x9,  x18, x19
+  addi  x7, x7, 2           /* moved up: non-memory instruction after the MX pair */
+  BLOCK 16, -1, 1, x20, x21, x22, x23
   addi  x5, x5, 32
   addi  x6, x6, 32
-  addi  x7, x7, 2
   addi  x28, x28, 2
   bne   x7, x29, 1b
   lw    x30, 32(sp)

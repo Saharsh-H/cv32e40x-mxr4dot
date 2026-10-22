@@ -1,13 +1,19 @@
 """Task 5: memory traffic of MX dot products - two separate regimes, never mixed.
 
 REGIME A - this system, measured (CV32E40X + MX coprocessor, task-3 K=4096 loops)
-  python3 analysis/bw_model.py regime-a <loop.json> [<loop.json> ...]
-  Each <loop.json> comes from tb/scripts/loop_report.py --json-out ... --meta
-  format=<mxfp4|mxfp8|mxfp4r>,dwait=<n>. For every (format, NACC, dwait) it prints
-  the bytes per cycle the loop actually reads (weights, activations), the share of
-  what the CV32E40X data port can supply (32-bit OBI, at most one access per
-  cycle: 4 B/cycle, 1 access/cycle), and - when several dwait settings are given -
-  how the measured extra cycles compare with dwait x accesses (fully additive?).
+  python3 analysis/bw_model.py regime-a [--md] <loop.json> [<loop.json> ...]
+  (analysis/regime_a_runs.sh makes the JSONs and calls this.) Each <loop.json> comes
+  from tb/scripts/loop_report.py --json-out ... --meta format=<mxfp4|mxfp8|mxfp4r>,
+  mode=<ideal|dwait|dgnt>,n=<n>, from a make-loop run with +gcount (measured data-port
+  grants per region). Settings: ideal; dwait n = "read latency n" (every data response,
+  load or store, n cycles later); dgnt n = "one data access per n+1 cycles". Tables:
+  R1 cycles, elements/cycle, slowdown vs ideal, MXFP4R/MXFP8 and MXFP4/MXFP8 elements/
+     cycle ratios, with the limit of each ratio in each mode: read latency -> ratio of the
+     measured per-step increments (cycles added per latency step); bandwidth (one access
+     per n+1 cycles) -> port-bound limit = inverse ratio of the measured grants;
+  R2 read-latency linearity: added cycles per latency step and per grant;
+  R3 bandwidth mode: cycles vs the port bound grants x (n+1);
+  R4 data-port utilisation from measured grants (static layout counts as cross-check).
 
 REGIME B - analytic decode model, NOT this system (compute assumed not to limit)
   python3 analysis/bw_model.py regime-b analysis/configs/<model>.json [...]
@@ -22,7 +28,11 @@ REGIME B - analytic decode model, NOT this system (compute assumed not to limit)
 Layer policy (eval v2, frameworks/language.py): every nn.Linear / HF Conv1D is
 quantised except lm_head; embeddings, norms, biases and lm_head stay BF16. The KV
 cache is BF16 for every format and read in full once per token at context length
-L (clamped to the model's maximum position).
+L (clamped to the model's maximum position). KV size uses num_key_value_heads
+(grouped-query attention). Each GEMV reads its own input vector (q, k, v and gate,
+up are counted separately; GPT-2's c_attn is one fused GEMV). Per token the BF16
+lm_head matrix is read once (tied or not) plus one embedding row (GPT-2: plus one
+position-embedding row).
 """
 import argparse
 import json
@@ -60,36 +70,110 @@ def loop_traffic(fmt, k):
 
 
 PORT_BYTES, PORT_ACCESSES = 4.0, 1.0
+FMTS = ('mxfp4', 'mxfp8', 'mxfp4r')
+VARIANTS = (('20', 'NACC=4'), ('10', 'NACC=1'))
+CAVEAT = ('REGIME A - this system (CV32E40X + MX coprocessor), MEASURED (MARK cycles, +gcount grants). '
+          'Instruction port ideal (as if cached); synthetic data; pre-quantised activations (runtime '
+          'quantisation not counted); the data-port model is a fixed latency / fixed rate model '
+          '(tb/mem_model.sv), not a memory hierarchy. Not regime B.')
 
 
-def regime_a(paths):
-    runs = [json.load(open(p)) for p in paths]
-    print('REGIME A - this system (CV32E40X + MX coprocessor), MEASURED loop cycles (MARK).')
-    print('Memory: data port with +dwait response latency (0 = ideal single-cycle); instruction')
-    print('port ideal. Pre-quantised activations; runtime activation quantisation not counted.')
-    print(f'Data port supplies at most {PORT_BYTES:g} B/cycle and {PORT_ACCESSES:g} access/cycle.\n')
-    hdr = (f'{"format":8}{"variant":8}{"dwait":>6}{"cycles":>8}{"elem/cyc":>9}{"W B/cyc":>9}{"A B/cyc":>9}'
-           f'{"tot B/cyc":>10}{"% bytes":>8}{"acc/cyc":>8}{"% slots":>8}{"dCyc":>7}{"w*acc":>7}{"ratio":>7}')
-    print(hdr)
-    base = {}
-    for r in runs:
-        for rid, reg in r['regions'].items():
-            if reg['mx']:
-                base.setdefault((r['format'], rid), {})[int(r['dwait'])] = reg['cycles']
-    for r in sorted(runs, key=lambda r: (r['format'], int(r['dwait']))):
-        k, fmt, w = r['k'], r['format'], int(r['dwait'])
-        wb, ab, acc = loop_traffic(fmt, k)
-        for rid, reg in sorted(r['regions'].items()):
-            if not reg['mx']:
-                continue
-            c = reg['cycles']
-            var = {'10': 'NACC=1', '20': 'NACC=4'}.get(str(rid), str(rid))
-            d = c - base[(fmt, rid)].get(0, c)
-            extra = f'{d:7d}{w * acc:7d}{(d / (w * acc)) if w else 0:7.2f}' if 0 in base[(fmt, rid)] and w else f'{"":21}'
-            print(f'{fmt:8}{var:8}{w:6d}{c:8d}{k / c:9.3f}{wb / c:9.3f}{ab / c:9.3f}{(wb + ab) / c:10.3f}'
-                  f'{100 * (wb + ab) / c / PORT_BYTES:7.1f}%{acc / c:8.3f}{100 * acc / c / PORT_ACCESSES:7.1f}%{extra}')
-    print('\ndCyc = cycles - cycles at dwait 0; w*acc = dwait x data accesses; ratio = dCyc / (w*acc)')
-    print('(ratio 1 = every wait cycle adds to the loop; < 1 = partly overlapped).')
+def setting_name(mode, n):
+    return {'ideal': 'ideal', 'dwait': f'read latency {n}', 'dgnt': f'1 access / {n + 1} cyc'}[mode]
+
+
+def regime_a(paths, md):
+    runs = {}
+    for p in paths:
+        r = json.load(open(p))
+        mode, n = r.get('mode', 'ideal'), int(r.get('n', 0))
+        if mode == 'ideal':
+            n = 0
+        runs[(r['format'], mode, n)] = r
+    settings = sorted({(m, n) for (_, m, n) in runs}, key=lambda x: ({'ideal': 0, 'dwait': 1, 'dgnt': 2}[x[0]], x[1]))
+    fmts = [f for f in FMTS if any(k[0] == f for k in runs)]
+    k = next(iter(runs.values()))['k']
+
+    def reg(f, s, rid):
+        return runs[(f, *s)]['regions'][rid]
+
+    def table(title, head, rows):
+        if md:
+            print(f'\n**{title}**\n')
+            print('| ' + ' | '.join(head) + ' |')
+            print('|' + '---|' * len(head))
+            for row in rows:
+                print('| ' + ' | '.join(str(x) for x in row) + ' |')
+        else:
+            print(f'\n{title}')
+            w = [max(len(str(x)) for x in col) for col in zip(head, *rows)]
+            for row in [head] + rows:
+                print('  '.join(str(x).rjust(c) for x, c in zip(row, w)))
+
+    print(CAVEAT)
+    # grants must not depend on timing: check, per format and variant, across settings
+    for f in fmts:
+        for rid, _ in VARIANTS:
+            g = {reg(f, s, rid)['grants'] for s in settings if (f, *s) in runs}
+            if len(g) != 1:
+                print(f'WARNING: {f} region {rid} grants differ across settings: {sorted(g)}')
+    for rid, var in VARIANTS:
+        g = {f: reg(f, ('ideal', 0), rid)['grants'] for f in fmts}
+        # R1
+        head = ['setting'] + [f'{f} {c}' for f in fmts for c in ('cycles', 'elem/cyc', 'slowdown')]
+        pairs = [(a, 'mxfp8') for a in ('mxfp4r', 'mxfp4') if a in fmts and 'mxfp8' in fmts]
+        head += [f'{a}/{b}' for a, b in pairs]
+        rows = []
+        for s in settings:
+            row = [setting_name(*s)]
+            for f in fmts:
+                c, c0 = reg(f, s, rid)['cycles'], reg(f, ('ideal', 0), rid)['cycles']
+                row += [c, f'{k / c:.3f}', f'{c / c0:.3f}']
+            row += [f'{reg(b, s, rid)["cycles"] / reg(a, s, rid)["cycles"]:.3f}' for a, b in pairs]
+            rows.append(row)
+        lat = sorted(n for (m, n) in settings if m == 'dwait')
+        if lat:
+            inc = {f: reg(f, ('dwait', lat[0]), rid)['cycles'] - reg(f, ('ideal', 0), rid)['cycles'] for f in fmts}
+            rows.append(['read-latency limit (per-step increments)'] + [''] * (3 * len(fmts))
+                        + [f'{inc[b] / inc[a]:.3f} ({inc[b]}/{inc[a]} cyc)' for a, b in pairs])
+        rows.append(['bandwidth limit (port-bound, grants)'] + [''] * (3 * len(fmts))
+                    + [f'{g[b] / g[a]:.3f} ({g[a]}/{g[b]} acc)' for a, b in pairs])
+        table(f'R1 {var}: cycles, elements/cycle (K={k}), slowdown vs ideal, elements/cycle ratios. '
+              f'Last two rows: the limit each ratio approaches as the latency grows (ratio of the cycles '
+              f'added per latency step) and as the access rate falls (port-bound: inverse grant ratio)', head, rows)
+        # R2
+        rows = []
+        for f in fmts:
+            lat = sorted(n for (m, n) in settings if m == 'dwait')
+            cyc = [reg(f, ('ideal', 0), rid)['cycles']] + [reg(f, ('dwait', n), rid)['cycles'] for n in lat]
+            steps = [b - a for a, b in zip(cyc, cyc[1:])]
+            const = len(set(steps)) == 1 and lat == list(range(1, len(lat) + 1))
+            rows.append([f, ', '.join(map(str, steps)), 'yes' if const else 'NO', g[f],
+                         f'{steps[0] / g[f]:.4f}' if steps else '', f'{g[f] / 2:g}'])
+        table(f'R2 {var}: read latency, added cycles per step 0->1->...->5', 
+              ['format', 'added cycles per step', 'constant', 'grants', 'per step / grants', 'grants / 2'], rows)
+        # R3
+        rows = []
+        for f in fmts:
+            for (m, n) in settings:
+                if m != 'dgnt':
+                    continue
+                c = reg(f, (m, n), rid)['cycles']
+                bound = g[f] * (n + 1)
+                rows.append([f, setting_name(m, n), c, bound, f'{c / bound:.3f}'])
+        table(f'R3 {var}: bandwidth mode, cycles vs port bound = grants x (n+1)',
+              ['format', 'setting', 'cycles', 'bound', 'cycles / bound'], rows)
+        # R4
+        rows = []
+        for f in fmts:
+            wb, ab, acc = loop_traffic(f, k)
+            for s in settings:
+                c = reg(f, s, rid)['cycles']
+                rows.append([f, setting_name(*s), c, g[f], f'{100 * g[f] / c / PORT_ACCESSES:.1f}%',
+                             f'{(wb + ab) / c:.3f}', f'{100 * (wb + ab) / c / PORT_BYTES:.1f}%', acc])
+        table(f'R4 {var}: data-port utilisation (measured grants; bytes from the data layout)',
+              ['format', 'setting', 'cycles', 'grants', 'access slots used', 'data B/cyc', '% of 4 B/cyc',
+               'static loop accesses'], rows)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +191,9 @@ def model_shapes(cfg):
         norms = (2 * 2 * h) * nl + 2 * h                                   # ln_1, ln_2 (w + b), ln_f
         kv_dim = h                                                         # n_kv_heads * head_dim
         max_pos = cfg['n_positions']
+        nkv, hd = nh, h // nh
+        pos_emb = max_pos * h                                              # wpe (learned positions)
+        window = None
     elif mt in ('llama', 'mistral'):
         h, nl, nh, v = cfg['hidden_size'], cfg['num_hidden_layers'], cfg['num_attention_heads'], cfg['vocab_size']
         inter = cfg['intermediate_size']
@@ -120,10 +207,16 @@ def model_shapes(cfg):
         norms = 2 * h * nl + h                                            # 2 RMSNorm per layer + final
         kv_dim = nkv * hd
         max_pos = cfg['max_position_embeddings']
+        pos_emb = 0                                                        # rotary: no parameters
+        window = cfg.get('sliding_window')
     else:
         raise NotImplementedError(f'model_type {mt}')
-    return dict(gemv=gemv, lm_head=v * h, embed_row=h, bias=bias, norms=norms,
-                kv_per_ctx=2 * nl * kv_dim, max_pos=max_pos, n_layers=nl)
+    # HF default for tie_word_embeddings is True (GPT-2's config does not set it)
+    tied = cfg.get('tie_word_embeddings', True)
+    return dict(gemv=gemv, lm_head=v * h, embed_row=h + (h if pos_emb else 0), bias=bias, norms=norms,
+                kv_per_ctx=2 * nl * kv_dim, max_pos=max_pos, n_layers=nl, tied=tied, nkv=nkv, nh=nh,
+                head_dim=hd, window=window,
+                params=sum(k * n for k, n in gemv) + bias + norms + v * h + (0 if tied else v * h) + pos_emb)
 
 
 def regime_b(paths, ctxs, bws):
@@ -138,29 +231,36 @@ def regime_b(paths, ctxs, bws):
         bf16_other = 2 * (sh['lm_head'] + sh['embed_row'] + sh['bias'] + sh['norms'])
         name = cfg.get('_name_or_path') or p
         print(f'== {name}  ({p})')
+        print(f'   parameters computed from config: {sh["params"]:,}; lm_head tied to the embedding: '
+              f'{sh["tied"]} (lm_head matrix counted once per token, plus one embedding row'
+              f'{" + one position row" if cfg.get("model_type") == "gpt2" else ""} read per token)')
+        print(f'   attention heads {sh["nh"]}, KV heads {sh["nkv"]}, head_dim {sh["head_dim"]}'
+              + (f', sliding window {sh["window"]}' if sh['window'] else ''))
         print(f'   quantised linear weights {n_w:,} elements; GEMV input elements per token {n_a:,} '
-              f'(activation/weight = 1/{n_w / n_a:,.0f}); BF16 lm_head+embedding row+biases+norms '
+              f'(activation/weight = 1/{n_w / n_a:,.0f}); BF16 lm_head+embedding row(s)+biases+norms '
               f'{bf16_other:,} B/token; KV (BF16) {2 * sh["kv_per_ctx"]:,} B per token of context; '
               f'max context {sh["max_pos"]}')
         cols = [0] + [min(c, sh['max_pos']) for c in ctxs]
+        if sh['window'] and any(c > sh['window'] for c in cols):
+            raise NotImplementedError('context beyond the sliding window: KV read would be capped')
         for c_req, c in zip([0] + ctxs, cols):
             if c != c_req:
                 print(f'   note: context {c_req} clamped to {c} (model maximum)')
         print(f'   {"format":24}{"b_w":>6}{"b_a":>6}' + ''.join(f'{"B/token L=" + str(c):>18}' for c in cols)
-              + f'{"act share":>10}' + ''.join(f'{"vs MXFP8 L=" + str(c):>16}' for c in cols))
+              + f'{"act B/tok":>11}{"act share":>10}' + ''.join(f'{"vs MXFP8 L=" + str(c):>16}' for c in cols))
         rows = {}
         for fname, bw_, ba_, _ in FORMATS:
             w_b, a_b = n_w * bw_ / 8, n_a * ba_ / 8
             tot = [w_b + a_b + bf16_other + 2 * sh['kv_per_ctx'] * c for c in cols]
-            rows[fname] = (tot, a_b / tot[0])
+            rows[fname] = (tot, a_b / tot[0], a_b)
         for fname, bw_, ba_, _ in FORMATS:
-            tot, share = rows[fname]
+            tot, share, a_b = rows[fname]
             ref = rows['MXFP8-E4M3'][0]
             print(f'   {fname:24}{bw_:6.2f}{ba_:6.2f}' + ''.join(f'{t:18,.0f}' for t in tot)
-                  + f'{100 * share:9.3f}%' + ''.join(f'{r / t:16.3f}' for r, t in zip(ref, tot)))
+                  + f'{a_b:11,.0f}{100 * share:9.3f}%' + ''.join(f'{r / t:16.3f}' for r, t in zip(ref, tot)))
         print(f'   illustrative tokens/s (bandwidth / bytes per token) at L={cols[0]} and L={cols[-1]}:')
         for fname, *_ in FORMATS:
-            tot, _ = rows[fname]
+            tot = rows[fname][0]
             print(f'   {fname:24}' + ''.join(f'{b / 1e9:6.1f} GB/s: {b / tot[0]:8.2f} | {b / tot[-1]:8.2f} tok/s   '
                                          for b in bws))
         print()
@@ -171,13 +271,14 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     a = sub.add_parser('regime-a')
     a.add_argument('loops', nargs='+')
+    a.add_argument('--md', action='store_true', help='Markdown tables')
     b = sub.add_parser('regime-b')
     b.add_argument('configs', nargs='+')
     b.add_argument('--ctx', default='512,4096')
     b.add_argument('--bw', default='17e9,50e9')
     args = ap.parse_args()
     if args.cmd == 'regime-a':
-        regime_a(args.loops)
+        regime_a(args.loops, args.md)
     else:
         regime_b(args.configs, [int(x) for x in args.ctx.split(',')], [float(x) for x in args.bw.split(',')])
 

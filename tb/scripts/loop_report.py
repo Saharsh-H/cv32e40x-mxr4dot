@@ -18,7 +18,10 @@ Columns:
   elem/cycle   K / cycles
 --mx gives the MX instruction count per region id (default 0).
 --json-out writes the same numbers (net, overhead subtracted) for analysis/bw_model.py;
---meta adds key=value pairs to it (e.g. format=mxfp4,dwait=0).
+--meta adds key=value pairs to it (e.g. format=mxfp4,mode=dwait,n=1).
+If the log was run with +gcount (mem_model.sv prints "[GNT] mark=<id> data_grants=<n>"
+at every MARK), each region also gets 'grants': data-port grants between its MARKs,
+net of the empty bracket's grants (region 90), and a 'grants' column is printed.
 """
 import argparse
 import json
@@ -33,8 +36,11 @@ ap.add_argument('--json-out', help='write the net numbers per region to this JSO
 ap.add_argument('--meta', default='', help='key=value,... added to the JSON (e.g. format=mxfp4,dwait=0)')
 args = ap.parse_args()
 
-marks, words = {}, []
+marks, words, gnt = {}, [], {}
 for line in open(args.log):
+    m = re.match(r'\[GNT\] mark=(\d+) data_grants=(\d+)', line)
+    if m:
+        gnt[int(m[1])] = int(m[2])
     m = re.match(r'\[MARK (\d+)\] cyc=(\d+)', line)
     if m:
         marks[int(m[1])] = int(m[2])
@@ -51,10 +57,15 @@ mx = {int(a): int(b) for a, b in (x.split(':') for x in args.mx.split(',') if x)
 names = {int(a): b for a, b in (x.split(':', 1) for x in args.names.split(',') if x)}
 cal_cyc = marks[91] - marks[90]
 cal_mcyc, cal_inst = regions[90]
-print(f'overhead (region 90, subtracted): MARK {cal_cyc}, mcycle {cal_mcyc}, minstret {cal_inst}')
+has_gnt = 90 in gnt and 91 in gnt
+cal_gnt = gnt[91] - gnt[90] if has_gnt else None
+print(f'overhead (region 90, subtracted): MARK {cal_cyc}, mcycle {cal_mcyc}, minstret {cal_inst}'
+      + (f', grants {cal_gnt}' if has_gnt else ''))
 print(f'{"region":<26}{"cycles":>8}{"mcycle":>8}{"diff":>6}{"instret":>9}{"MX":>5}'
-      f'{"host/MX":>9}{"host/elem":>10}{"elem/cyc":>9}')
+      f'{"host/MX":>9}{"host/elem":>10}{"elem/cyc":>9}' + (f'{"grants":>8}' if has_gnt else ''))
 out = dict(k=args.k, overhead=dict(mark=cal_cyc, mcycle=cal_mcyc, minstret=cal_inst), regions={})
+if has_gnt:
+    out['overhead']['grants'] = cal_gnt
 out.update(dict(x.split('=', 1) for x in args.meta.split(',') if x))
 for rid in sorted(regions):
     if rid == 90:
@@ -64,9 +75,13 @@ for rid in sorted(regions):
     ins = regions[rid][1] - cal_inst
     n = mx.get(rid, 0)
     out['regions'][rid] = dict(name=names.get(rid, str(rid)), cycles=cyc, mcycle=mc, minstret=ins, mx=n)
+    g = ''
+    if has_gnt:
+        out['regions'][rid]['grants'] = gnt[rid + 1] - gnt[rid] - cal_gnt
+        g = f'{out["regions"][rid]["grants"]:>8}'
     hmx = f'{(ins - n) / n:9.2f}' if n else f'{"-":>9}'
     print(f'{names.get(rid, str(rid)):<26}{cyc:>8}{mc:>8}{mc - cyc:>6}{ins:>9}{n:>5}{hmx}'
-          f'{(ins - n) / args.k:>10.3f}{args.k / cyc:>9.3f}')
+          f'{(ins - n) / args.k:>10.3f}{args.k / cyc:>9.3f}{g}')
 if args.json_out:
     with open(args.json_out, 'w') as f:
         json.dump(out, f, indent=2)

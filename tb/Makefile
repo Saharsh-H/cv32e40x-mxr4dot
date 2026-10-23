@@ -156,6 +156,7 @@ MXDOTP_SRCS := \
 	$(MXDOTP_RTL_DIR)/mxdotp_fp4_fused_engine.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_m2xfp4_fused_engine.sv \
+	$(MXDOTP_RTL_DIR)/mxdotp_mailbox.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_xif.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_core_top.sv
 

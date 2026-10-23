@@ -571,17 +571,13 @@ module mxdotp_xif
 
     
     localparam int MAILBOX_DEPTH = 4;
-    typedef struct packed { logic signed [PSUM_WIDTH-1:0] p1, p2; } mailbox_entry_t;
-    mailbox_entry_t mailbox_q [0:MAILBOX_DEPTH-1];
-    logic [$clog2(MAILBOX_DEPTH)-1:0] mailbox_head_ptr, mailbox_tail_ptr;
-    logic [$clog2(MAILBOX_DEPTH+1)-1:0] mailbox_count;
-    
-    wire mailbox_full = (mailbox_count == MAILBOX_DEPTH);
-    wire mailbox_empty = (mailbox_count == '0);
-    wire mailbox_valid_q = !mailbox_empty;
-    wire signed [PSUM_WIDTH-1:0] mailbox_p1_q = mailbox_q[mailbox_head_ptr].p1;
-    wire signed [PSUM_WIDTH-1:0] mailbox_p2_q = mailbox_q[mailbox_head_ptr].p2;
-    
+    // The FIFO itself is mxdotp_mailbox.sv (moved out unchanged, 23 Oct 2026,
+    // so the residue pair can be synthesised with this exact mailbox).
+    logic mailbox_full, mailbox_valid_q;
+    logic signed [PSUM_WIDTH-1:0] mailbox_p1_q, mailbox_p2_q;
+    logic signed [PSUM_WIDTH-1:0] dotp_engine_p1, dotp_engine_p2;
+    logic dotp_result_ready_xif;  // driven with the other result-ready gates (order-queue head)
+
     wire dotp_result_valid;
     logic [X_ID_WIDTH-1:0] dotp_result_id;  // was missing entirely - Verilator was silently
                                              // creating this as an implicit 1-bit net, truncating
@@ -601,27 +597,22 @@ module mxdotp_xif
     wire dotp_result_fire = dotp_result_valid && !mailbox_full && dotp_result_ready_xif;
     wire mailbox_push = dotp_result_fire;
     wire mailbox_pop = final_engine_start;
-    
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            mailbox_head_ptr <= '0; mailbox_tail_ptr <= '0; mailbox_count <= '0;
-        end else begin
-            if (mailbox_push) mailbox_tail_ptr <= (mailbox_tail_ptr == MAILBOX_DEPTH-1) ? '0 : mailbox_tail_ptr + 1'b1;
-            if (mailbox_pop) mailbox_head_ptr <= (mailbox_head_ptr == MAILBOX_DEPTH-1) ? '0 : mailbox_head_ptr + 1'b1;
-            case ({mailbox_push, mailbox_pop})
-                2'b10: mailbox_count <= mailbox_count + 1'b1;
-                2'b01: mailbox_count <= mailbox_count - 1'b1;
-            endcase
-        end
-    end
-    always_ff @(posedge clk_i) begin
-        if (mailbox_push) begin
-            mailbox_q[mailbox_tail_ptr].p1 <= dotp_engine_p1;
-            mailbox_q[mailbox_tail_ptr].p2 <= dotp_engine_p2;
-        end
-    end
 
-    logic signed [PSUM_WIDTH-1:0] dotp_engine_p1, dotp_engine_p2;
+    mxdotp_mailbox #(
+        .DEPTH (MAILBOX_DEPTH)
+    ) mailbox_i (
+        .clk_i     (clk_i),
+        .rst_ni    (rst_ni),
+        .push_i    (mailbox_push),
+        .push_p1_i (dotp_engine_p1),
+        .push_p2_i (dotp_engine_p2),
+        .pop_i     (mailbox_pop),
+        .full_o    (mailbox_full),
+        .valid_o   (mailbox_valid_q),
+        .head_p1_o (mailbox_p1_q),
+        .head_p2_o (mailbox_p2_q)
+    );
+
     assign dotp_engine_start = dotp_pending_head_ok && dotp_engine_ready;
 
 
@@ -889,7 +880,7 @@ module mxdotp_xif
     // engine design, just one instance of it per engine/slot - the engines
     // have no visibility into the shared order queue, so this must live here.
     assign final_result_ready = (order_head_tag == MX_SLOT_FINAL) && result_if.result_ready;
-    wire dotp_result_ready_xif = (order_head_tag == MX_SLOT_DOTP) && result_if.result_ready;
+    assign dotp_result_ready_xif = (order_head_tag == MX_SLOT_DOTP) && result_if.result_ready;
     assign fused4_result_ready  = (order_head_tag == MX_SLOT_FUSED)    && result_if.result_ready;
     assign fused8_result_ready  = (order_head_tag == MX_SLOT_FUSED8)   && result_if.result_ready;
     assign fusedm2_result_ready = (order_head_tag == MX_SLOT_FUSED_M2) && result_if.result_ready;

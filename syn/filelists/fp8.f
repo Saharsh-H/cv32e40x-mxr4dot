@@ -1,4 +1,4 @@
-# Source list: standalone synthesis of the fp8 engine (Phase A').
+# Source list: standalone synthesis of the fp8 engine.
 # Paths are relative to the repo root. MX_RTL = rtl/mxdotp.
 #
 # Order matters: the package must be read before anything that imports it,

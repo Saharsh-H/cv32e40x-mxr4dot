@@ -1,5 +1,5 @@
 //==============================================================================
-// File    : mx_syn_m2.sv
+// File    : mx_syn_fp8.sv
 // Project : MXDOTP XIF Coprocessor - Phase A' standalone synthesis harness
 //------------------------------------------------------------------------------
 // SYNTHESIS SCAFFOLDING - NOT DESIGN RTL. Never add this file (or anything else
@@ -12,7 +12,7 @@
 //   1. MODULE NAME != FILE NAME. mxdotp_fp4_fused_engine.sv declares a module
 //      called `mxdotp_fused_engine` (the DECLFILENAME warning seen in the
 //      lint output reports). A synthesis script pointed at "the fp4 engine"
-//      would need to know that mismatch. mx_syn_m2 is a predictable name.
+//      would need to know that mismatch. mx_syn_fp8 is a predictable name.
 //
 //   2. PARAMETER PINNING. Every engine's own defaults happen to match the
 //      deployed values today (X_ID_WIDTH=4 / X_RFR_WIDTH=64 / X_RFW_WIDTH=32,
@@ -28,10 +28,10 @@
 // already register their own inputs (rs1_q/rs2_q/rs3_q on capture) and outputs
 // (result_data_q), so the real critical paths are internal register-to-register
 // and are measured correctly without extra scaffolding. I/O timing is handled
-// by set_input_delay/set_output_delay in constraints/engine.sdc, not here.
+// by set_input_delay/set_output_delay in constraints/mx.sdc, not here.
 //==============================================================================
 
-module mx_syn_m2 #(
+module mx_syn_fp8 #(
   parameter int X_ID_WIDTH  = 4,     // pinned: mxdotp_core_top.sv
   parameter int X_RFR_WIDTH = 64,    // pinned: dual-read operand width (2*XLEN)
   parameter int X_RFW_WIDTH = 32     // pinned: single-write result width
@@ -55,8 +55,8 @@ module mx_syn_m2 #(
   output logic [X_RFW_WIDTH-1:0]  result_data_o
 );
 
-  // M2XFP4 engine, from mxdotp_m2xfp4_fused_engine.sv.
-  mxdotp_m2xfp4_fused_engine #(
+  // MXFP8 engine, from mxdotp_fp8_fused_engine.sv.
+  mxdotp_fp8_fused_engine #(
     .X_ID_WIDTH  (X_ID_WIDTH),
     .X_RFR_WIDTH (X_RFR_WIDTH),
     .X_RFW_WIDTH (X_RFW_WIDTH)

@@ -6,8 +6,9 @@
 //   Standalone MXDOTP arithmetic engine - the DOTP half of what used to be
 //   one shared mxdotp_execute module. See mxdotp_xif.sv's "pipelined
 //   coprocessor" milestone header (mxdotp_pkg.sv) for why this was split out:
-//   giving MXDOTP its own independent start_i/busy_o/done_o (instead of
-//   sharing one with MXFINAL) is what actually lets a new MXDOTP begin while
+//   giving MXDOTP its own independent handshake (start_i/ready_o in,
+//   result_valid_o/result_ready_i out; once start_i/busy_o/done_o) instead of
+//   sharing one with MXFINAL is what actually lets a new MXDOTP begin while
 //   a previous MXFINAL is still computing - splitting the RTL into separate
 //   files alone would not have achieved that; independent *control* is the
 //   part that matters.

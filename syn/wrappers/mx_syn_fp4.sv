@@ -28,7 +28,7 @@
 // already register their own inputs (rs1_q/rs2_q/rs3_q on capture) and outputs
 // (result_data_q), so the real critical paths are internal register-to-register
 // and are measured correctly without extra scaffolding. I/O timing is handled
-// by set_input_delay/set_output_delay in constraints/engine.sdc, not here.
+// by set_input_delay/set_output_delay in constraints/mx.sdc, not here.
 //==============================================================================
 
 module mx_syn_fp4 #(

@@ -18,7 +18,8 @@
 #   - check_design also run before synthesis and its report kept, as the
 #     synthesis-side check for unresolved / undriven nets (open since Q11);
 #   - his cost groups and report set kept; his whole-design reports that need
-#     a full core (report_dp, report_resources) kept as catch'ed calls.
+#     a full core (report_dp, report_resources) kept as catch'ed calls;
+#   - reports/mx_summary.txt: worst setup slack for sweep.sh.
 #
 # UNVERIFIED (no Genus available when written): every command and attribute
 # marked "UNVERIFIED" below; the rest is taken over from his run.tcl as is.
@@ -97,6 +98,23 @@ catch {report_dp                  > $REPORTS_DIR/datapath.rpt}
 catch {report_resources           > $REPORTS_DIR/resources.rpt}
 catch {check_design               > $REPORTS_DIR/check_design.rpt}
 catch {report_timing -lint        > $REPORTS_DIR/timing_lint.rpt}
+
+#---- machine-readable summary (read by sweep.sh) ---------------------------------------
+# Worst setup slack over all paths (I/O included), in Genus' own time unit (ps
+# by default - UNVERIFIED: compare with timing_top.rpt on the first run). Each
+# candidate query is tried in turn; the one that answered is recorded. If none
+# answers, the value is "unknown" and sweep.sh stops.
+set mx_wns unknown
+set mx_wns_query none
+foreach q {{get_db current_design .slack} {get_db [get_db designs] .slack}} {   ;# UNVERIFIED: attribute
+    if {![catch {eval $q} v] && [string is double -strict $v]} { set mx_wns $v; set mx_wns_query $q; break }
+}
+set fp [open $REPORTS_DIR/mx_summary.txt w]
+puts $fp "tool genus"
+puts $fp "period_ns $MX_PERIOD_NS"
+puts $fp "setup_wns_raw $mx_wns"
+puts $fp "setup_wns_query $mx_wns_query"
+close $fp
 
 #---- outputs for Innovus (his) -------------------------------------------------------
 write_hdl > $OUTPUTS_DIR/${MX_TOP}_synth.v

@@ -207,6 +207,14 @@ module mxdotp_xif
     // stalled by our own busyness.
     //--------------------------------------------------------------------------
 
+    // Declared here, ahead of their first use; each is driven further down
+    // (fused pending-commit queue, FUSED engine section, order queue).
+    wire           fused_pending_full;
+    logic          fused4_engine_start;
+    logic          fused8_engine_start;
+    logic          fusedm2_engine_start;
+    wire mx_slot_e order_head_tag;
+
     assign issue_if.issue_ready =
         !is_mx                                    ? 1'b1 :
         (mx_operation == MX_FUNCT3_DOTP)           ? !dotp_pending_full :
@@ -435,7 +443,7 @@ module mxdotp_xif
     logic [MX_FUSED_PENDING_CNT_WIDTH-1:0] fused_pending_count;
 
     wire fused_pending_empty = (fused_pending_count == '0);
-    wire fused_pending_full  = (fused_pending_count == MX_FUSED_PENDING_DEPTH);
+    assign fused_pending_full  = (fused_pending_count == MX_FUSED_PENDING_DEPTH);
     wire fused_pending_head_valid = !fused_pending_empty;
 
     // Resolving fresh THIS cycle (commit_valid arrives for a still-PENDING
@@ -460,9 +468,8 @@ module mxdotp_xif
          (fused_pending_head_committed_now && commit_if.commit.commit_kill));
 
     // fused_pending_push/pop drive the shared queue's tail/head. The pop
-    // condition forward-references the two engines' start signals (defined in
-    // the FUSED engine section below); both are pure combinational, so the
-    // forward reference is safe - same style already used for order_head_tag.
+    // condition uses the engines' start signals, which are driven in the FUSED
+    // engine section below (declared above, with the other early declarations).
     wire fused_pending_push = accept_fused;
     // Which engine the head belongs to, by its element format: MXFP8 -> the fp8
     // engine, M2XFP4 -> the m2 engine, everything else (MXFP4 plus the
@@ -472,10 +479,9 @@ module mxdotp_xif
                        (fused_pending_q[fused_pending_head_ptr].format == MX_FMT_MXFP8);
     wire head_is_m2  = fused_pending_head_valid &&
                        (fused_pending_q[fused_pending_head_ptr].format == MX_FMT_M2XFP4);
-    // fused4/fused8/fusedm2_engine_start are defined in the FUSED engine
+    // fused4/fused8/fusedm2_engine_start are driven in the FUSED engine
     // section below; all are pure combinational (start derives from ready,
-    // ready comes straight from an engine instance), so this forward reference
-    // is safe - same style already used for order_head_tag elsewhere.
+    // ready comes straight from an engine instance).
     wire fused_pending_pop  = fused_pending_head_kill ||
                               fused4_engine_start || fused8_engine_start ||
                               fusedm2_engine_start;
@@ -766,19 +772,19 @@ module mxdotp_xif
     // program order correctly.
     //--------------------------------------------------------------------------
 
-    logic fused4_engine_start, fused4_engine_ready;
+    logic fused4_engine_ready;
     logic fused4_result_valid, fused4_result_ready;
     logic [X_ID_WIDTH-1:0]  fused4_result_id;
     logic [4:0]             fused4_result_rd;
     logic [X_RFW_WIDTH-1:0] fused4_result_data;
 
-    logic fused8_engine_start, fused8_engine_ready;
+    logic fused8_engine_ready;
     logic fused8_result_valid, fused8_result_ready;
     logic [X_ID_WIDTH-1:0]  fused8_result_id;
     logic [4:0]             fused8_result_rd;
     logic [X_RFW_WIDTH-1:0] fused8_result_data;
 
-    logic fusedm2_engine_start, fusedm2_engine_ready;
+    logic fusedm2_engine_ready;
     logic fusedm2_result_valid, fusedm2_result_ready;
     logic [X_ID_WIDTH-1:0]  fusedm2_result_id;
     logic [4:0]             fusedm2_result_rd;
@@ -909,7 +915,7 @@ module mxdotp_xif
     logic [MX_ORDER_PTR_WIDTH-1:0] order_head_ptr, order_tail_ptr;
     logic [MX_ORDER_CNT_WIDTH-1:0] order_count;
 
-    wire mx_slot_e order_head_tag = order_q[order_head_ptr];
+    assign order_head_tag = order_q[order_head_ptr];
     wire           order_empty    = (order_count == '0);
 
     logic push_any;

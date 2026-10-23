@@ -203,6 +203,13 @@ module mxdotp_final_engine
   logic signed [MXF_LZC_WIDTH-1:0] back1b_word_comb;
   logic                            back1b_sticky_comb;
 
+  // Comb signals from the operand decode, BACK1 and BACK2 further down,
+  // registered by the always_ff below (declared here, ahead of that use).
+  logic [31:0]      old_acc;
+  mx_exp_t          back1_anchor_comb;  // the SELECTED anchor (sexp1 or sexp2)
+  logic             back1_is_acc_comb;
+  mxf_lead_result_t back2_lead_comb;
+
   always_ff @(posedge clk_i) begin
     if (!stall) begin
       if (start_i) begin
@@ -263,7 +270,6 @@ module mxdotp_final_engine
   //----------------------------------------------------------------------------
 
   logic [7:0]  a_scale, ar_scale, b_scale;
-  logic [31:0] old_acc;
 
   // Two E8M0 combined scales. NOTE: the "-2" that corrects for fp4_to_code's
   // implicit *4 per raw product (code = 2*value, so code_a*code_b =
@@ -273,7 +279,6 @@ module mxdotp_final_engine
   // convention, so a single shared -2 in finalize covers both. (Applying -2
   // here as well would double-count it - a factor-of-4 / 2-binade error.)
   mx_exp_t sexp1, sexp2;              // scale_exp(...), the raw combined scale
-  mx_exp_t back1_anchor_comb;         // the SELECTED anchor (sexp1 or sexp2)
   int      delta;                     // Sa - Sar >= 0 (Sar <= Sa proven)
 
   // acc decode (subnormals honored, exactly as the plain-MXFP4 frame does)
@@ -294,7 +299,6 @@ module mxdotp_final_engine
 
   logic signed [MXF_LZC_WIDTH-1:0] back1_word_comb;
   logic                            back1_sticky_comb;
-  logic                            back1_is_acc_comb;
 
   always_comb begin
     a_scale  = rs1_q[31:24];
@@ -371,8 +375,6 @@ module mxdotp_final_engine
   // registered sum. Feeds lead_q (the Y|Z cut) rather than continuing
   // straight into mantissa extraction.
   //----------------------------------------------------------------------------
-
-  mxf_lead_result_t back2_lead_comb;
 
   // neg_adjust: a nonzero positive residue was floor-truncated below the
   // word (the sticky-direction fix). For MXFINAL that is simply the

@@ -391,7 +391,8 @@ module mxdotp_final_engine
   //----------------------------------------------------------------------------
   // BACK3: mantissa extraction + sticky + round + exponent clamp
   // (mxdotp_pkg.sv's acc_finalize) on the registered leading-one-scan
-  // result. Result latched into result_data_q on the done_o edge, same
+  // result. Result latched into result_data_q on the edge it advances
+  // (!stall && back2_valid_q, below), same
   // discipline as before - never a live combinational function of captured
   // state exposed on the output port.
   //----------------------------------------------------------------------------

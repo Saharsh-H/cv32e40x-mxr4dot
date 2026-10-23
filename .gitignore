@@ -18,6 +18,7 @@ tb/tb_mxdotp_core.vcd
 
 # ReadMe files
 syn/README.md
+syn/results/
 
 #Pycache files
 verification/__pycache__

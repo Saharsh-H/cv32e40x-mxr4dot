@@ -13,12 +13,12 @@
 # conventions below; closure = all paths including I/O, post-route setup and
 # hold WNS >= 0 (reg2reg-only is a separate, labelled diagnostic).
 #
-# UNVERIFIED (no Cadence tools or nangate45 .lib available when written):
-#   - the library time unit is assumed to be ns (values below are in ns);
-#   - BUF_X1 pin names A (input) / Z (output) are assumed;
-#   - MX_BUF_X1_A_CAP must be filled in from the .lib (placeholder below makes
-#     the tool stop until it is);
-#   - remove_from_collection is assumed to be accepted by Genus/Innovus here.
+# Library values checked against NangateOpenCellLibrary_typical.lib (the
+# collaborator's copy, cadence_ref/srip_mxfp/library/lib, 23 Oct 2026):
+# time_unit "1ns", capacitive_load_unit (1,ff); cell BUF_X1 has input pin A
+# (capacitance 0.974659) and output pin Z (function A).
+# UNVERIFIED (no Genus/Innovus here): that read_sdc in Genus 21.10 accepts the
+# Tcl in this file (set, expr, remove_from_collection).
 #==============================================================================
 
 #---- per run (run.sh rewrites this line) -------------------------------------
@@ -28,16 +28,15 @@ set MX_PERIOD_NS 3.000
 # Conventions, not measurements (user, 23 Oct): fixed absolute values rather
 # than a fraction of the period - skew and jitter do not scale with the
 # period, and a fraction would give slow designs a larger margin than fast
-# ones. To be replaced by the collaborator's values if his setup has them.
+# ones. The collaborator's setup has none to take over: his run.tcl creates the
+# clock only ("Removed uncertainty, IO delays, transition, and load").
 set MX_UNC_SETUP_PRECTS  0.100   ;# pre-CTS: skew + jitter (synthesis, placement)
 set MX_UNC_SETUP_POSTCTS 0.050   ;# post-CTS: jitter only - applied by innovus.tcl after CTS
 set MX_UNC_HOLD          0.020
 
 #---- library values -----------------------------------------------------------
-# Input pin capacitance of BUF_X1/A in the .lib's capacitance unit. FILL IN
-# from the .lib before the first run; the placeholder is not a number, so the
-# set_load expression below fails loudly instead of running unconstrained.
-set MX_BUF_X1_A_CAP FILL_IN_FROM_LIB
+# Input pin capacitance of BUF_X1/A, fF (.lib: pin (A) capacitance 0.974659).
+set MX_BUF_X1_A_CAP 0.974659
 
 #---- clock --------------------------------------------------------------------
 create_clock -name clk -period $MX_PERIOD_NS [get_ports clk_i]

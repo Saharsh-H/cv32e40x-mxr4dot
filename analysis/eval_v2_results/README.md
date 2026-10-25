@@ -11,7 +11,8 @@ as used for the v2 results"). Layout as on the GPU PC: `<modality>/<model>/<mode
 | `speech/` | `~/mxr4dot/results_v2/speech/` | wav2vec2-base-960h, LibriSpeech test-clean, WER × 8 formats |
 | `vision/` | `~/mxr4dot/results_v2/vision/` | ResNet-50, ViT-B/16, DeiT-S/16, ImageNet validation (50,000 images) top-1 × 8 formats |
 | `error_analysis/` | `~/mxr4dot/results_v2/error_analysis/` | per-layer operand error (NMSE, dB) per model; `report.md` |
-| `zeroshot/` | `~/mxr4dot/results_v2/zeroshot/` | lm-eval 0-shot: GPT-2 8 formats × 5 tasks; Llama-2-7B 5 formats × 4 tasks (boolq failed: CUDA out of memory) |
+| `zeroshot/` | `~/mxr4dot/results_v2/zeroshot/` | lm-eval 0-shot: GPT-2 8 formats × 5 tasks; Llama-2-7B 5 formats × 4 tasks (its boolq failed there: CUDA out of memory) |
+| `zeroshot/meta-llama__Llama-2-7b-hf/*__boolq.json` | `~/mxr4dot_v2check/results_v2/zeroshot/meta-llama__Llama-2-7b-hf/` (re-run 24 Oct 2026) | Llama-2-7B boolq × 5 formats, re-run at **batch size 1** (the other 4 Llama-2 tasks ran at batch size 4) from eval commit `ab59463` (branch `eval-v2`, clean; recorded `env.git` `ab59463`), config `~/q12_rerun/zeroshot_llama2_7b_boolq_bs1.yaml`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
 | `zeroshot_report.md` | `~/mxr4dot/results_v2/zeroshot_report.md` | zero-shot table with paired CIs |
 | `ci_report.md` | `~/mxr4dot/results_v2/ci_report.md` | paired bootstrap CIs vs MXFP4R (residue on activations), all modalities, as produced on the GPU PC |
 | `other/speech/` | `~/mxr4dot/results_v2_other/speech/` | wav2vec2-base-960h, LibriSpeech test-other, WER × 8 formats |

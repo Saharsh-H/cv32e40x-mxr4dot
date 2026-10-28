@@ -4,7 +4,7 @@
 usage (from tb/):
   python3 scripts/gen_loop_data.py --format mxfp4 --k 4096 --seed 1 \\
       --out-s build/sw/mxfp4_data.S --out-json build/sw/mxfp4_expected.json
-  formats: mxfp4, mxfp8 (E4M3), mxfp4r (residue on activations)
+  formats: mxfp4, mxfp8 (E4M3), mxfp4r (residue on activations), m2xfp4
 
 Design
 ------
@@ -32,6 +32,14 @@ Design
              error (same rule on e = a - dequant(primary), own scale S_ar);
              weights plain MXFP4. An all-zero residue block gets S_ar = S_a, so
              Property 1 (S_ar <= S_a) always holds - asserted.
+     m2xfp4: MXFP4 block scales (same OCP rule) plus 2 metadata bits per
+             8-element subgroup. Activations: m2_golden.m2_encode_subgroup
+             (Elem-EM, top-1 element extended to E2M3; its E2M1 nibbles are
+             asserted equal to the plain MXFP4 codes). Weights: Sg-EM k in
+             0..3 per subgroup, chosen by exact squared error of the subgroup
+             quantised at scale (1 + k/4) * 2^S_w (ties to the lowest k). This
+             is a correctness data rule, not eval v2's bias search. Every
+             Elem-EM and Sg-EM value 0..3 must occur (asserted, counts printed).
 3. Memory layout, exactly as the kernels read it (all little-endian):
      FP4 arrays (mx_a, mx_w, mx_ar): K/2 bytes; byte j = element 2j (low
        nibble) | element 2j+1 (high nibble); instruction n's 64-bit operand
@@ -39,11 +47,16 @@ Design
      FP8 arrays (mx_a, mx_w): K bytes; instruction n's operand (8 elements,
        element i at bits [8i+7:8i]) = the word pair at byte 8n.
      scales (mx_sa, mx_sw, mx_sar): K/32 E8M0 bytes, one per block.
+     M2XFP4 metadata (mx_am = Elem-EM, mx_wm = Sg-EM): K/32 bytes, one per
+       block; low nibble = the block's first instruction, high nibble = its
+       second; in each nibble subgroup 0 in bits [1:0], subgroup 1 in [3:2]
+       (the rs3 field order of m2_golden._pack_meta).
 4. Golden expected values, bit-exact, computed in the kernels' exact order,
    one "step" per group (mxfp4: one mxfused, 16 elements; mxfp8: one mxfused,
    8 elements; mxfp4r: one mxresdot + mxfinal pair, 16 elements):
      mxfp4  : fp4_golden.fp4_fused_model, each step also == project_rne(reference)
      mxfp8  : fp8_golden.fp8_fused_model (E4M3), each step also == project_rne(reference)
+     m2xfp4 : m2_golden.m2_fused_model, each step also == project_rne(reference)
      mxfp4r : mxdotp_golden.dotp_engine_model -> (p1, p2), then
               mxfinal_golden.mxfinal_frame, each step also == mxfinal_ref, and
               mxdotp_golden.exact_end_to_end == mxfinal_golden.exact_value
@@ -68,6 +81,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'verification'))
 import fp4_golden as f4      # noqa: E402
 import fp8_golden as f8      # noqa: E402
+import m2_golden as m2       # noqa: E402
 import mxdotp_golden as md   # noqa: E402
 import mxfinal_golden as mf  # noqa: E402
 
@@ -313,7 +327,81 @@ def run_mxfp4r(k, seed):
                                        property1_margin=[min(margins), max(margins)])
 
 
-RUN = dict(mxfp4=run_mxfp4, mxfp8=run_mxfp8, mxfp4r=run_mxfp4r)
+M2_SUB = 8           # M2XFP4 subgroup size (mxdotp_pkg.sv M2_SUBGROUP_LEN)
+
+
+def m2_weight_subgroup(ws, s_w):
+    """Sg-EM for one 8-element weight subgroup at E8M0 exponent s_w: the k in
+    0..3 whose quantisation at scale (1 + k/4) * 2^s_w has the smallest exact
+    squared error (ties to the lowest k). Returns (nibbles, k)."""
+    best = None
+    for k in range(4):
+        sc = (1 + Fraction(k, 4)) * Fraction(2) ** s_w
+        nibs = [(8 if x < 0 else 0) | nearest_code(Fraction(x) / sc, E2M1_TABLE, 7) for x in ws]
+        err = sum((Fraction(x) - f4.fp4_value(c) * sc) ** 2 for x, c in zip(ws, nibs))
+        if best is None or err < best[0]:
+            best = (err, nibs, k)
+    return best[1], best[2]
+
+
+def pack_meta(meta):
+    """meta[n] = [subgroup 0, subgroup 1] 2-bit values of instruction n -> one byte per
+    block: low nibble instruction 2b, high nibble 2b+1, subgroup 0 in bits [1:0]."""
+    nib = [(m[1] & 3) << 2 | (m[0] & 3) for m in meta]
+    by = bytes(nib[2 * b] | (nib[2 * b + 1] << 4) for b in range(len(nib) // 2))
+    for n in range(len(meta)):          # round trip into the rs3 field (m2_golden._pack_meta)
+        x = (by[n // 2] >> (4 * (n % 2))) & 0xF
+        assert m2._pack_meta(meta[n], [0, 0]) & 0xF == x, n
+    return by
+
+
+def run_m2xfp4(k, seed):
+    a, w = gen_values(k, seed)
+    an_plain, sa = quantize(a, 'fp4')
+    wn_plain, sw = quantize(w, 'fp4')
+    check_quantizer(a, an_plain, sa, 'fp4')
+    check_quantizer(w, wn_plain, sw, 'fp4')
+    an, wn, elem, sg = [], [], [], []
+    for g in range(k // M2_SUB):
+        b = g * M2_SUB // BLOCK
+        xs = [Fraction(x) for x in a[g * M2_SUB:(g + 1) * M2_SUB]]
+        nibs, meta = m2.m2_encode_subgroup(xs, sa[b] - 127)
+        assert nibs == an_plain[g * M2_SUB:(g + 1) * M2_SUB], g     # E2M1 part = plain MXFP4
+        t = m2.top1_idx(nibs)
+        S = Fraction(2) ** (sa[b] - 127)
+        assert abs(xs[t] / S - m2.m2_x_value(nibs[t], meta)) <= abs(xs[t] / S - f4.fp4_value(nibs[t])), g
+        an += nibs
+        elem.append(meta)
+        wnibs, kk = m2_weight_subgroup(w[g * M2_SUB:(g + 1) * M2_SUB], sw[b] - 127)
+        wn += wnibs
+        sg.append(kk)
+    n_instr = k // 16
+    elem_em = [[elem[2 * n], elem[2 * n + 1]] for n in range(n_instr)]
+    sg_em = [[sg[2 * n], sg[2 * n + 1]] for n in range(n_instr)]
+    cov = dict(elem_em=[elem.count(v) for v in range(4)], sg_em=[sg.count(v) for v in range(4)])
+    assert all(cov['elem_em']) and all(cov['sg_em']), f'metadata coverage incomplete: {cov}'
+
+    def step(n, acc):
+        x, y = an[16 * n:16 * n + 16], wn[16 * n:16 * n + 16]
+        got = m2.m2_fused_model(x, y, elem_em[n], sg_em[n], sa[n // 2], sw[n // 2], acc)
+        exact = m2.reference(x, y, elem_em[n], sg_em[n], sa[n // 2], sw[n // 2], acc)
+        assert got == m2.project_rne(exact), n
+        return got, exact
+
+    exp, st1, st4 = chains(n_instr, step)
+    xval = [m2.m2_x_value(c, elem[i // M2_SUB]) if i % M2_SUB == m2.top1_idx(an[i // M2_SUB * M2_SUB:(i // M2_SUB + 1) * M2_SUB])
+            else f4.fp4_value(c) for i, c in enumerate(an)]
+    exact = sum(xv * f4.fp4_value(y) * (1 + Fraction(sg[i // M2_SUB], 4))
+                * Fraction(2) ** (sa[i // BLOCK] + sw[i // BLOCK] - 254)
+                for i, (xv, y) in enumerate(zip(xval, wn)))
+    arrays = [('mx_a', pack_fp4(an)), ('mx_w', pack_fp4(wn)), ('mx_sa', bytes(sa)), ('mx_sw', bytes(sw)),
+              ('mx_am', pack_meta(elem_em)), ('mx_wm', pack_meta(sg_em))]
+    return arrays, exp, st1, st4, dict(groups=n_instr, mx_instr=n_instr, exact=exact,
+                                       real=sum(x * y for x, y in zip(a, w)), scales=dict(a=sa, w=sw),
+                                       coverage=cov)
+
+
+RUN = dict(mxfp4=run_mxfp4, mxfp8=run_mxfp8, mxfp4r=run_mxfp4r, m2xfp4=run_m2xfp4)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +443,9 @@ def main():
     print('  E8M0 scale range: ' + ', '.join(f'{n.upper()} [{min(v)}, {max(v)}]' for n, v in sc.items()))
     if 'property1_margin' in info:
         print(f'  Property 1 margin S_a - S_ar: min {info["property1_margin"][0]}, max {info["property1_margin"][1]}')
+    if 'coverage' in info:
+        print(f'  metadata coverage (subgroups per value 0..3): Elem-EM {info["coverage"]["elem_em"]}, '
+              f'Sg-EM {info["coverage"]["sg_em"]}')
     print(f'  steps that round (RNE != exact): NACC=1 {st1["inexact"]}/{st1["steps"]}, '
           f'NACC=4 {st4["inexact"]}/{st4["steps"]}')
     print(f'  NACC=1  (and software baseline): 0x{exp["exp_nacc1"]:08x}  {bits_to_float(exp["exp_nacc1"])!r}')
@@ -371,7 +462,8 @@ def main():
                            groups=info['groups'], mx_instr=info['mx_instr'],
                            inexact_steps_nacc1=[st1['inexact'], st1['steps']],
                            inexact_steps_nacc4=[st4['inexact'], st4['steps']],
-                           exact_dot=float(info['exact'])), f, indent=2)
+                           exact_dot=float(info['exact']),
+                           **({'metadata_coverage': info['coverage']} if 'coverage' in info else {})), f, indent=2)
 
 
 if __name__ == '__main__':

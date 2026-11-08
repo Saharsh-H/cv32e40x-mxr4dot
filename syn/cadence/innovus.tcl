@@ -111,8 +111,14 @@ if {[llength $mx_in] + [llength $mx_out] != $mx_n_terms} {
     mx_stop "pins: [llength $mx_in] inputs + [llength $mx_out] outputs != $mx_n_terms terms (inout ports?)"
 }
 setPinAssignMode -pinEditInBatch true
-editPin -pin $mx_in  -side Left  -layer metal3 -spreadType side -fixedPin 1
-editPin -pin $mx_out -side Right -layer metal3 -spreadType side -fixedPin 1
+# Pins spread over each edge minus 5 um at both ends (= the core margin), so no pin
+# sits in a corner (checkPinAssignment IMPPTN-1755 otherwise). Range from the die box;
+# spreading runs clockwise, so the right edge goes from top to bottom.
+lassign [lindex [dbGet top.fPlan.box] 0] mx_x0 mx_y0 mx_x1 mx_y1
+set mx_pin_y0 [expr {$mx_y0 + 5}]
+set mx_pin_y1 [expr {$mx_y1 - 5}]
+editPin -pin $mx_in  -side Left  -layer metal3 -spreadType range -start [list $mx_x0 $mx_pin_y0] -end [list $mx_x0 $mx_pin_y1] -fixedPin 1
+editPin -pin $mx_out -side Right -layer metal3 -spreadType range -start [list $mx_x1 $mx_pin_y1] -end [list $mx_x1 $mx_pin_y0] -fixedPin 1
 setPinAssignMode -pinEditInBatch false
 catch {checkPinAssignment -outFile $REPORTS_DIR/pins.rpt}
 
@@ -122,7 +128,7 @@ globalNetConnect $MX_GND_NET -type pgpin -pin $MX_GND_NET -inst * -module {}
 addRing -nets "$MX_PWR_NET $MX_GND_NET" \
         -type core_rings \
         -width 2 \
-        -spacing 1 \
+        -spacing 1.5 \
         -layer {top 7 bottom 7 left 6 right 6}
 addStripe -nets "$MX_PWR_NET $MX_GND_NET" \
           -layer 6 \
@@ -147,7 +153,6 @@ setPlaceMode -timingDriven true -place_global_cong_effort high
 place_opt_design
 
 #---- CTS (his) ------------------------------------------------------------------------
-set_ccopt_property use_inverters true
 set_ccopt_property routing_top_min_fanout 10000
 create_ccopt_clock_tree_spec
 clock_opt_design
@@ -189,7 +194,7 @@ catch {report_power                             > ${REPORTS_DIR}/power_default_a
 catch {reportCongestion -hotSpot                > ${REPORTS_DIR}/congestion.rpt}
 catch {reportDensity                            > ${REPORTS_DIR}/density.rpt}
 catch {reportWire                               > ${REPORTS_DIR}/wirelength.rpt}
-catch {report_clock_trees                       > ${REPORTS_DIR}/cts.rpt}
+catch {report_ccopt_clock_trees -file ${REPORTS_DIR}/cts.rpt}
 catch {verifyGeometry     -report ${REPORTS_DIR}/drc.rpt}
 catch {verifyConnectivity -report ${REPORTS_DIR}/routing.rpt}
 catch {summaryReport -noHtml -outFile ${REPORTS_DIR}/design_summary.rpt}

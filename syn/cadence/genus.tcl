@@ -78,22 +78,16 @@ syn_opt -incremental
 # replay flow).
 catch {report_qor                 > $REPORTS_DIR/qor.rpt}
 catch {report_area -detail        > $REPORTS_DIR/area.rpt}
-catch {report_area -hier          > $REPORTS_DIR/area_hier.rpt}
 catch {report_gates               > $REPORTS_DIR/gate_report.rpt}
-catch {report_gates -type sequential    > $REPORTS_DIR/sequential.rpt}
-catch {report_gates -type combinational > $REPORTS_DIR/combinational.rpt}
-catch {report_timing -summary     > $REPORTS_DIR/timing_summary.rpt}
+catch {report_timing -path_type summary -max_paths $MX_N_CRIT_PATHS > $REPORTS_DIR/timing_summary.rpt}
 catch {report_timing -max_paths $MX_N_CRIT_PATHS > $REPORTS_DIR/timing_top.rpt}
-catch {report_timing -endpoints $MX_N_WORST_PER_PATH > $REPORTS_DIR/critical_path.rpt}
+catch {report_timing -path_type endpoint -max_paths $MX_N_CRIT_PATHS > $REPORTS_DIR/critical_path.rpt}
 foreach g {C2C I2C C2O I2O} {
     catch {report_timing -cost_group $g -max_paths 10 > $REPORTS_DIR/timing_$g.rpt}   ;# UNVERIFIED: -cost_group option
 }
 catch {report_clocks              > $REPORTS_DIR/clock.rpt}
 catch {report_exceptions          > $REPORTS_DIR/constraint.rpt}
-catch {report_power -detail       > $REPORTS_DIR/power_default_activity.rpt}
-catch {report_power -hier         > $REPORTS_DIR/power_hier_default_activity.rpt}
 catch {report_design              > $REPORTS_DIR/design_summary.rpt}
-catch {report_nets -fanout        > $REPORTS_DIR/fanout.rpt}
 catch {report_dp                  > $REPORTS_DIR/datapath.rpt}
 catch {report_resources           > $REPORTS_DIR/resources.rpt}
 catch {check_design               > $REPORTS_DIR/check_design.rpt}

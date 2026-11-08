@@ -47,8 +47,8 @@ module mx_find_lead #(
   logic [W-1:0] mag;
 
   logic [EXT_W-1:0]   mag_ext;
-  logic               chunk_any  [NCHUNKS];
-  logic [LOCAL_W-1:0] chunk_lead [NCHUNKS];
+  logic [NCHUNKS-1:0]               chunk_any;
+  logic [NCHUNKS-1:0][LOCAL_W-1:0] chunk_lead;
 
   logic               any_set;
   logic [CIDX_W-1:0]  win_chunk;

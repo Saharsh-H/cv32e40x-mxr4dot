@@ -112,8 +112,9 @@ point() {
     fi
     setup="$(kv setup_wns_raw "$gs")"; hold=-
     [[ "$setup" =~ ^-?[0-9.]+([eE][-+]?[0-9]+)?$ ]] || { echo "sweep.sh: Genus slack '$setup' at $p ns ($gs)" >&2; exit 1; }
+    # A printed "-0.0" is a violation rounded to zero by the tool: any leading minus fails.
+    if [[ "$setup" != -* ]] && awk -v x="$setup" 'BEGIN{exit !(x>=0)}'; then VERDICT=closes; else VERDICT=fails; fi
     setup="$(awk -v x="$setup" -v s="$GSCALE" 'BEGIN{printf "%.4f", x*s}')"
-    if awk -v x="$setup" 'BEGIN{exit !(x>=0)}'; then VERDICT=closes; else VERDICT=fails; fi
   else
     if [ -f "$is" ] && reusable "$dir"; then how=reused
     else
@@ -125,7 +126,8 @@ point() {
     for v in "$setup" "$hold"; do
       [[ "$v" =~ ^-?[0-9.]+([eE][-+]?[0-9]+)?$ ]] || { echo "sweep.sh: Innovus slack '$v' at $p ns ($is)" >&2; exit 1; }
     done
-    if awk -v s="$setup" -v h="$hold" 'BEGIN{exit !(s>=0 && h>=0)}'; then VERDICT=closes; else VERDICT=fails; fi
+    # A printed "-0.000" is a violation rounded to zero (timeDesign then reports violating paths): any leading minus fails.
+    if [[ "$setup" != -* && "$hold" != -* ]] && awk -v s="$setup" -v h="$hold" 'BEGIN{exit !(s>=0 && h>=0)}'; then VERDICT=closes; else VERDICT=fails; fi
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$setup" "$hold" "$VERDICT" "$how" "$COMMIT" >> "$TSV"
   POINTS="$POINTS$p $VERDICT

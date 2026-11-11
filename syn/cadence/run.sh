@@ -6,7 +6,7 @@
 #   syn/cadence/run.sh smoke      start Genus and Innovus on a one-line script each,
 #                                 print their versions (no design, no library needed)
 #
-#   <design>  fp4 | fp8 | m2 | dotp | mxfinal | pair   (top = mx_syn_<design>)
+#   <design>  fp4 | fp8 | m2 | dotp | mxfinal | pair | xif | eth | eth8   (top = mx_syn_<design>)
 #   stages    prep  write the per-run files only (no tools; checks inputs)
 #             syn   prep + Genus
 #             pnr   Innovus on an existing syn result of the same run
@@ -31,7 +31,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-DESIGNS="fp4 fp8 m2 dotp mxfinal pair"
+DESIGNS="fp4 fp8 m2 dotp mxfinal pair xif eth eth8"
 
 usage() { sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 GENUS_CMD="${GENUS_CMD:-genus -batch -files}"        # UNVERIFIED invocation
